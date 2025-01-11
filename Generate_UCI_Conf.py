@@ -96,7 +96,7 @@ def create_config_file(dataset_name, output_dir="."):
     }
     }
 
-    filename = f"{dataset_info['name'].lower().replace(' ', '_')}.conf"
+    filename = f"UCI_Configs/{dataset_info['name'].lower().replace(' ', '_')}.conf"
     with open(os.path.join(output_dir, filename), 'w') as f:
         f.write(f"# {filename} best_accuracy: {dataset_info['accuracy']}, instances: {dataset_info['instances']}\n")
         json.dump(config, f, indent=4)
@@ -104,6 +104,19 @@ def create_config_file(dataset_name, output_dir="."):
 
 
 if __name__ == "__main__":
+    import os
+
+    def ensure_directory_exists(directory_path):
+        if not os.path.exists(directory_path):
+            os.makedirs(directory_path)
+            print(f"Directory '{directory_path}' created.")
+        else:
+            print(f"Exisiting Directory '{directory_path}' will be used to update configure files from UCI data.")
+
+    # Example usage
+    directory_path = 'UCI_Configs'
+    ensure_directory_exists(directory_path)
+
     # Get the list of available datasets
     available_datasets = get_available_datasets()
     print("Available datasets:")

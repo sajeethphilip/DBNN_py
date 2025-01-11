@@ -188,6 +188,56 @@ class DatasetConfig:
         # Look for .conf files in the current directory
         return [f.split('.')[0] for f in os.listdir()
                 if f.endswith('.conf') and os.path.isfile(f)]
+#---------------------------------------Feature Filter with a #------------------------------------
+def _filter_features_from_config(df: pd.DataFrame, config: Dict) -> pd.DataFrame:
+    """
+    Filter DataFrame columns based on commented features in config
+
+    Args:
+        df: Input DataFrame
+        config: Configuration dictionary containing column names
+
+    Returns:
+        DataFrame with filtered columns
+    """
+    # If no column names in config, return original DataFrame
+    if 'column_names' not in config:
+        return df
+
+    # Get column names from config
+    column_names = config['column_names']
+
+    # Create mapping of position to column name
+    col_mapping = {i: name.strip() for i, name in enumerate(column_names)}
+
+    # Identify commented features (starting with #)
+    commented_features = {
+        i: name.lstrip('#').strip()
+        for i, name in col_mapping.items()
+        if name.startswith('#')
+    }
+
+    # Get current DataFrame columns
+    current_cols = df.columns.tolist()
+
+    # Columns to drop (either by name or position)
+    cols_to_drop = []
+
+    for pos, name in commented_features.items():
+        # Try to drop by name first
+        if name in current_cols:
+            cols_to_drop.append(name)
+        # If name not found, try position
+        elif pos < len(current_cols):
+            cols_to_drop.append(current_cols[pos])
+
+    # Drop identified columns
+    if cols_to_drop:
+        df = df.drop(columns=cols_to_drop)
+        print(f"Dropped commented features: {cols_to_drop}")
+
+    return df
+#-----------------------------------------------------------------------------------------------------------
 
 class GPUDBNN:
     """GPU-Optimized Deep Bayesian Neural Network with Parallel Feature Pair Processing"""
@@ -632,7 +682,7 @@ class GPUDBNN:
 
     def save_predictions(self, X: pd.DataFrame, predictions: torch.Tensor, output_file: str, true_labels: pd.Series = None):
         """
-        Save predictions along with input data and probabilities to a CSV file
+        Save predictions along with input data and probabilities to a CSV file with improved confidence check
 
         Args:
             X: Input DataFrame
@@ -680,25 +730,46 @@ class GPUDBNN:
         # Add maximum probability column
         result_df['max_probability'] = all_probabilities.max(axis=1)
 
-        # Add confidence-based pass/fail label
+        # Improved confidence check that considers both probability and correctness
         n_classes = len(self.label_encoder.classes_)
-        confidence_threshold = 1.0 / n_classes
-        result_df['confidence_check'] = np.where(
-            result_df['max_probability'] <= confidence_threshold,
-            'Failed',
-            'Passed'
+        confidence_threshold = 1.0 / n_classes   # Increased threshold for stricter confidence check
+
+        # Determine confidence check status
+        result_df['confidence_check'] = 'Failed'
+        correct_and_confident = (
+            (result_df['predicted_class'] == result_df['true_class']) &
+            (result_df['max_probability'] > confidence_threshold)
         )
+        result_df.loc[correct_and_confident, 'confidence_check'] = 'Passed'
 
         # Save to CSV
         result_df.to_csv(output_file, index=False)
         print(f"Saved predictions with probabilities to {output_file}")
 
-        # Print summary statistics
-        n_failed = (result_df['confidence_check'] == 'Failed').sum()
+        # Calculate accuracy metrics
+        correct_predictions = (result_df['predicted_class'] == result_df['true_class']).sum()
+        total_predictions = len(result_df)
+        accuracy = correct_predictions / total_predictions
+
+        # Print detailed summary statistics
+        print(f"\nPrediction Summary:")
+        print(f"Total predictions: {total_predictions}")
+        print(f"Correct predictions: {correct_predictions}")
+        print(f"Accuracy: {accuracy:.4f}")
         print(f"\nConfidence Check Summary:")
-        print(f"Total predictions: {len(result_df)}")
-        print(f"Failed (probability <= {confidence_threshold:.3f}): {n_failed}")
-        print(f"Passed (probability > {confidence_threshold:.3f}): {len(result_df) - n_failed}")
+        print(f"Passed: {(result_df['confidence_check'] == 'Passed').sum()}")
+        print(f"Failed: {(result_df['confidence_check'] == 'Failed').sum()}")
+
+        # Save visualization
+        plt.figure(figsize=(10, 6))
+        plt.hist(result_df['max_probability'], bins=20, alpha=0.5)
+        plt.axvline(x=confidence_threshold, color='r', linestyle='--', label='Confidence Threshold')
+        plt.xlabel('Maximum Probability')
+        plt.ylabel('Count')
+        plt.title('Distribution of Prediction Probabilities')
+        plt.legend()
+        plt.savefig(output_file.replace('.csv', '_probability_dist.png'))
+        plt.close()
 
 #------------------------------------------------------------End of PP code ---------------------------------------------------
     def _compute_pairwise_likelihood(self, dataset, labels, feature_dims):
@@ -875,6 +946,9 @@ class GPUDBNN:
             }
 
             df = pd.read_csv(data, **read_params)
+
+            # Filter features based on config
+            df = _filter_features_from_config(df, self.config)
 
             # Handle target column
             if isinstance(self.config['target_column'], int):
@@ -1257,9 +1331,56 @@ def plot_confusion_matrix(confusion_mat: np.ndarray, class_names: np.ndarray, da
 
 
 
+def generate_test_datasets():
+    """Generate XOR and 3D XOR test datasets"""
+    # Generate 2D XOR
+    with open('xor.csv', 'w') as f:
+        f.write('x1,x2,target\n')
+        f.write('0,0,0\n')
+        f.write('0,1,1\n')
+        f.write('1,0,1\n')
+        f.write('1,1,0\n')
+        f.write('0,0,0\n')
+        f.write('0,1,1\n')
+        f.write('1,0,1\n')
+        f.write('1,1,0\n')
+        f.write('0,0,0\n')
+        f.write('0,1,1\n')
+        f.write('1,0,1\n')
+        f.write('1,1,0\n')
+
+    # Generate 3D XOR
+    with open('xor3d.csv', 'w') as f:
+        f.write('x1,x2,x3,target\n')
+        f.write('0,0,0,0\n')
+        f.write('0,0,1,1\n')
+        f.write('0,1,0,1\n')
+        f.write('0,1,1,0\n')
+        f.write('1,0,0,1\n')
+        f.write('1,0,1,0\n')
+        f.write('1,1,0,0\n')
+        f.write('1,1,1,1\n')
+        f.write('0,0,0,0\n')
+        f.write('0,0,1,1\n')
+        f.write('0,1,0,1\n')
+        f.write('0,1,1,0\n')
+        f.write('1,0,0,1\n')
+        f.write('1,0,1,0\n')
+        f.write('1,1,0,0\n')
+        f.write('1,1,1,1\n')
+        f.write('0,0,0,0\n')
+        f.write('0,0,1,1\n')
+        f.write('0,1,0,1\n')
+        f.write('0,1,1,0\n')
+        f.write('1,0,0,1\n')
+        f.write('1,0,1,0\n')
+        f.write('1,1,0,0\n')
+        f.write('1,1,1,1\n')
+
+
 if __name__ == "__main__":
     # Generate test datasets
-    #qgenerate_test_datasets()
+    generate_test_datasets()
 
     # Test XOR and 3D XOR
     test_datasets = ['xor', 'xor3d']
