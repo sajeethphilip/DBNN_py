@@ -680,96 +680,40 @@ class GPUDBNN:
         self._save_model_components()
         return self.current_W.cpu(), error_rates
 
-    def save_predictions(self, X: pd.DataFrame, predictions: torch.Tensor, output_file: str, true_labels: pd.Series = None):
-        """
-        Save predictions along with input data and probabilities to a CSV file with improved confidence check
+    def save_predictions(self, X: pd.DataFrame, predictions: torch.Tensor,
+                        output_file: str, true_labels: pd.Series = None):
+        plt.figure(figsize=(15, 12))
 
-        Args:
-            X: Input DataFrame
-            predictions: Model predictions
-            output_file: Path to save the CSV file
-            true_labels: Ground truth labels if available
-        """
-        # Move tensors to CPU for numpy operations
-        predictions = predictions.cpu()
+        # Enhanced confusion matrix
+        cm = confusion_matrix(true_labels, predictions)
+        class_labels = self.label_encoder.classes_
 
-        # Create result DataFrame with input data
-        result_df = X.copy()
+        # Improved visualization
+        sns.heatmap(cm,
+                    annot=True,
+                    fmt='d',
+                    cmap='Blues',
+                    xticklabels=class_labels,
+                    yticklabels=class_labels,
+                    square=True,  # Make cells square
+                    cbar_kws={'label': 'Count'})
 
-        # Convert predictions to original class labels
-        pred_labels = self.label_encoder.inverse_transform(predictions.numpy())
-        result_df['predicted_class'] = pred_labels
+        plt.title('Confusion Matrix', pad=20)
+        plt.ylabel('True Label', labelpad=10)
+        plt.xlabel('Predicted Label', labelpad=10)
 
-        # Add ground truth if available
-        if true_labels is not None:
-            result_df['true_class'] = true_labels
+        # Rotate labels for better readability
+        plt.xticks(rotation=45, ha='right')
+        plt.yticks(rotation=0)
 
-        # Get the preprocessed features for probability computation
-        X_processed = self._preprocess_data(X, is_training=False)
-        X_tensor = torch.FloatTensor(X_processed).to(self.device)
-
-        # Compute probabilities in batches
-        batch_size = 32
-        all_probabilities = []
-
-        for i in range(0, len(X_tensor), batch_size):
-            batch_end = min(i + batch_size, len(X_tensor))
-            batch_X = X_tensor[i:batch_end]
-
-            # Get probabilities for this batch
-            batch_probs = self._compute_batch_posterior(batch_X)
-            all_probabilities.append(batch_probs.cpu().numpy())
-
-        # Combine all batch probabilities
-        all_probabilities = np.vstack(all_probabilities)
-
-        # Add probability columns for each class
-        for i, class_name in enumerate(self.label_encoder.classes_):
-            result_df[f'prob_{class_name}'] = all_probabilities[:, i]
-
-        # Add maximum probability column
-        result_df['max_probability'] = all_probabilities.max(axis=1)
-
-        # Improved confidence check that considers both probability and correctness
-        n_classes = len(self.label_encoder.classes_)
-        confidence_threshold = 1.0 / n_classes   # Increased threshold for stricter confidence check
-
-        # Determine confidence check status
-        result_df['confidence_check'] = 'Failed'
-        correct_and_confident = (
-            (result_df['predicted_class'] == result_df['true_class']) &
-            (result_df['max_probability'] > confidence_threshold)
-        )
-        result_df.loc[correct_and_confident, 'confidence_check'] = 'Passed'
-
-        # Save to CSV
-        result_df.to_csv(output_file, index=False)
-        print(f"Saved predictions with probabilities to {output_file}")
-
-        # Calculate accuracy metrics
-        correct_predictions = (result_df['predicted_class'] == result_df['true_class']).sum()
-        total_predictions = len(result_df)
-        accuracy = correct_predictions / total_predictions
-
-        # Print detailed summary statistics
-        print(f"\nPrediction Summary:")
-        print(f"Total predictions: {total_predictions}")
-        print(f"Correct predictions: {correct_predictions}")
-        print(f"Accuracy: {accuracy:.4f}")
-        print(f"\nConfidence Check Summary:")
-        print(f"Passed: {(result_df['confidence_check'] == 'Passed').sum()}")
-        print(f"Failed: {(result_df['confidence_check'] == 'Failed').sum()}")
-
-        # Save visualization
-        plt.figure(figsize=(10, 6))
-        plt.hist(result_df['max_probability'], bins=20, alpha=0.5)
-        plt.axvline(x=confidence_threshold, color='r', linestyle='--', label='Confidence Threshold')
-        plt.xlabel('Maximum Probability')
-        plt.ylabel('Count')
-        plt.title('Distribution of Prediction Probabilities')
-        plt.legend()
-        plt.savefig(output_file.replace('.csv', '_probability_dist.png'))
+        plt.tight_layout()
+        plt.savefig(output_file.replace('.csv', '_confusion_matrix.png'),
+                    dpi=300,
+                    bbox_inches='tight',
+                    facecolor='white',
+                    edgecolor='none')
         plt.close()
+
 
 #------------------------------------------------------------End of PP code ---------------------------------------------------
     def _compute_pairwise_likelihood(self, dataset, labels, feature_dims):
@@ -848,29 +792,7 @@ class GPUDBNN:
                         categorical_columns.append(column)
         return categorical_columns
 
-    def _encode_categorical_features(self, df: pd.DataFrame, is_training: bool = True) -> pd.DataFrame:
-        """Encode categorical features with saved mappings or create new ones during training"""
-        df_encoded = df.copy()
-        categorical_columns = self._detect_categorical_columns(df)
 
-        for column in categorical_columns:
-            if is_training:
-                if column not in self.categorical_encoders:
-                    # Create new mapping for training data
-                    unique_values = df[column].unique()
-                    self.categorical_encoders[column] = {
-                        value: idx for idx, value in enumerate(unique_values)
-                    }
-
-            # Apply encoding
-            if column in self.categorical_encoders:
-                mapping = self.categorical_encoders[column]
-                # Handle unseen categories in test data by assigning a default value
-                df_encoded[column] = df[column].map(lambda x: mapping.get(x, -1))
-            else:
-                raise ValueError(f"No encoding found for categorical column {column}")
-
-        return df_encoded
 
     def _preprocess_data(self, X: pd.DataFrame, is_training: bool = True) -> torch.Tensor:
         # Make a copy to avoid modifying original data
@@ -1126,44 +1048,91 @@ class GPUDBNN:
     def _get_model_components_filename(self):
         """Get filename for model components"""
         return os.path.join('Model', f'Best_{self.dataset_name}_components.pkl')
+#----------------Handling categorical variables across sessions -------------------------
+    def _save_categorical_encoders(self):
+        if self.categorical_encoders:
+            encoders_dict = {
+                column: {
+                    str(k): int(v) for k, v in mapping.items()
+                } for column, mapping in self.categorical_encoders.items()
+            }
+            metadata = {
+                'encoders': encoders_dict,
+                'timestamp': pd.Timestamp.now().isoformat(),
+                'column_types': {col: str(dtype) for col, dtype in self.original_columns.items()}
+            }
+            with open(self._get_encoders_filename(), 'w') as f:
+                json.dump(metadata, f, indent=2)
+
+    def _load_categorical_encoders(self):
+        """Load categorical feature encoders from file"""
+        encoders_file = self._get_encoders_filename()
+        if os.path.exists(encoders_file):
+            with open(encoders_file, 'r') as f:
+                encoders_dict = json.load(f)
+                self.categorical_encoders = {
+                    column: {k: int(v) for k, v in mapping.items()}
+                    for column, mapping in encoders_dict.items()
+                }
+    def _encode_categorical_features(self, df: pd.DataFrame, is_training: bool = True):
+        df_encoded = df.copy()
+        categorical_columns = self._detect_categorical_columns(df)
+
+        for column in categorical_columns:
+            if is_training:
+                if column not in self.categorical_encoders:
+                    unique_values = df[column].unique()
+                    self.categorical_encoders[column] = {
+                        value: idx for idx, value in enumerate(unique_values)
+                    }
+            mapping = self.categorical_encoders[column]
+            df_encoded[column] = df[column].map(lambda x: mapping.get(x, -1))
+
+        return df_encoded
+
+#--------------------------------------------------------------------------------------------------------------
 
     def _save_model_components(self):
-        """Save all necessary model components"""
-        import pickle
-        components = {
-            'scaler': self.scaler,
-            'label_encoder': self.label_encoder,
-            'likelihood_params': self.likelihood_params,
-            'feature_pairs': self.feature_pairs,
-            'feature_columns': getattr(self, 'feature_columns', None),
-            'categorical_encoders': self.categorical_encoders,
-            'high_cardinality_columns': getattr(self, 'high_cardinality_columns', [])
-        }
-        with open(self._get_model_components_filename(), 'wb') as f:
-            pickle.dump(components, f)
-        print(f"Saved model components to {self._get_model_components_filename()}")
+            """Save all necessary model components"""
+            components = {
+                'scaler': self.scaler,
+                'label_encoder': self.label_encoder,
+                'likelihood_params': self.likelihood_params,
+                'feature_pairs': self.feature_pairs,
+                'categorical_encoders': self.categorical_encoders,
+                'feature_columns': self.feature_columns,
+                'target_column': self.target_column,
+                'target_classes': self.label_encoder.classes_,
+                'target_mapping': dict(zip(self.label_encoder.classes_,
+                                         range(len(self.label_encoder.classes_)))),
+                'config': self.config,
+                'high_cardinality_columns': getattr(self, 'high_cardinality_columns', []),
+                'original_columns': getattr(self, 'original_columns', None),
+                'best_error': getattr(self, 'best_error', float('inf'))
+            }
+
+            with open(self._get_model_components_filename(), 'wb') as f:
+                pickle.dump(components, f)
+
+
 
     def _load_model_components(self):
         """Load all model components"""
-        import pickle
         components_file = self._get_model_components_filename()
-        if not os.path.exists(components_file):
-            return False
-        try:
+        if os.path.exists(components_file):
             with open(components_file, 'rb') as f:
                 components = pickle.load(f)
-            self.scaler = components['scaler']
-            self.label_encoder = components['label_encoder']
-            self.likelihood_params = components['likelihood_params']
-            self.feature_pairs = components['feature_pairs']
-            self.feature_columns = components.get('feature_columns')
-            self.categorical_encoders = components['categorical_encoders']
-            self.high_cardinality_columns = components.get('high_cardinality_columns', [])
-            print(f"Loaded model components from {components_file}")
-            return True
-        except Exception as e:
-            print(f"Error loading model components: {str(e)}")
-            return False
+                self.label_encoder.classes_ = components['target_classes']
+                self.scaler = components['scaler']
+                self.label_encoder = components['label_encoder']
+                self.likelihood_params = components['likelihood_params']
+                self.feature_pairs = components['feature_pairs']
+                self.feature_columns = components.get('feature_columns')
+                self.categorical_encoders = components['categorical_encoders']
+                self.high_cardinality_columns = components.get('high_cardinality_columns', [])
+                print(f"Loaded model components from {components_file}")
+                return True
+
 
 
     def predict_and_save(self, save_path=None, batch_size: int = 32):
