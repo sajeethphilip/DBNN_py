@@ -1,0 +1,74 @@
+\documentclass{article}
+\usepackage{tikz}
+\usetikzlibrary{shapes.geometric, arrows.meta, positioning, calc}
+\usepackage{amsmath}
+
+% Define \argmax
+\newcommand{\argmax}{\operatornamewithlimits{argmax}}
+
+\begin{document}
+
+\tikzset{
+    process/.style = {rectangle, minimum width=3cm, minimum height=1cm, text centered, draw=black, fill=blue!20},
+    decision/.style = {diamond, minimum width=3cm, minimum height=1cm, text centered, draw=black, fill=orange!20},
+    arrow/.style = {thick,->,>=Stealth}
+}
+
+\begin{center}
+\begin{tikzpicture}[node distance=2cm]
+    % Main processing nodes
+    \node (input) [process] {Input Data \(X\)};
+    \node (preprocess) [process, below=of input] {Preprocess \& Scale};
+    \node (pairwise) [process, below=of preprocess] {Compute Pairwise Features};
+    \node (likelihood) [process, below=of pairwise] {Likelihood Computation};
+    \node (posterior) [decision, below=of likelihood] {Update Posterior};
+    \node (weights) [process, below=of posterior] {Weight Update};
+    \node (predict) [process, below=of weights] {Prediction};
+
+    % Connections
+    \draw [arrow] (input) -- (preprocess);
+    \draw [arrow] (preprocess) -- (pairwise);
+    \draw [arrow] (pairwise) -- (likelihood);
+    \draw [arrow] (likelihood) -- (posterior);
+    \draw [arrow] (posterior) -- (weights);
+    \draw [arrow] (weights) -- (predict);
+\end{tikzpicture}
+\end{center}
+
+\section*{Mathematical Formulation}
+
+\subsection*{Key Equations}
+
+1. Pairwise Likelihood Computation:
+\[P(X|W) = \prod_{i,j} P(x_i, x_j|W)\]
+
+2. Posterior Update:
+\[P(W|X) = \frac{P(X|W)P(W)}{\sum_W P(X|W)P(W)}\]
+
+3. Weight Update Rule:
+\[W_{new} = W_{current} \cdot (1 + \alpha(1 - \frac{P_1}{P_2}))\]
+where:
+\begin{itemize}
+\item \(P_1\): posterior probability of true class
+\item \(P_2\): maximum posterior probability of other classes
+\item \(\alpha\): learning rate
+\end{itemize}
+
+4. Multivariate Normal PDF for Feature Pairs:
+\[P(x_i, x_j|W) = \frac{1}{2\pi|\Sigma|^{1/2}} \exp\left(-\frac{1}{2}(x-\mu)^T\Sigma^{-1}(x-\mu)\right)\]
+
+5. Final Prediction:
+\[y_{pred} = \argmax_c \sum_{i,j} \log P(x_i, x_j|W_c) + \log P(W_c)\]
+
+\subsection*{Implementation Details}
+
+1. Feature Processing:
+\[\text{scaled}_x = \frac{x - \mu}{\sigma + \epsilon}\]
+
+2. Numerical Stability:
+\[\text{log\_likelihood} = \log(P(X|W) + \epsilon)\]
+
+3. Weight Bounds:
+\[W_{final} = \text{clamp}(W_{new}, \epsilon, 10.0)\]
+
+\end{document}
