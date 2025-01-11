@@ -2,7 +2,7 @@ The Difference Boosting Neural Network (DBNN) published in  Intelligent Data Ana
 for the classification of the feature space overcoming the limitations of the Naive Bayesian networks while at the same time maintaining its simplicity. The original code was in C++ and was used only by a selected group of people. 
 The Python version is a rewrite in just a few lines of code with examples from the UCI repository that can be downloaded and used to create training/test data to evaluate the model quickly. A manual is in preparation.
 
-You can generate config files for UCI data (that can be used as an example) and get the required data for evaluation using the Generate and Get functions.
+You can generate config files for UCI data (that can be used as an example) and get the required data for evaluation using the Generate and Get functions. NOTE: You need not have to download the data unless you want to look at it in detail. The config data has the path to the file and can be directly used by the code to get the data.
 
 Add a # to the configure file features before the feature names to exclude any feature from the computation. By default, any repetitions with high cardinality will be filtered out.
 
