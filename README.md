@@ -9,3 +9,5 @@ Add a # to the configure file features before the feature names to exclude any f
 By default, the Imposed conditional independence is assumed on pairs of features ("feature_group_size": 2) but can be edited in the conf file to any number equal/less than the total number of features.
 
 Press "q" or "Q" key during training to interrupt training and go to the next stage.
+
+The older version of the C++ code used space as the separator, which is not ideal. space2csv.py function can convert the file into CSV.
