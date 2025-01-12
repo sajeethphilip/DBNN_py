@@ -20,7 +20,12 @@ from scipy.stats import normaltest
 import numpy as np
 from itertools import combinations
 import torch
-#from pynput import keyboard
+try:
+    from pynput import keyboard
+    nokbd=False
+except:
+    print("Keyboard control using q key for skipping training is not supported without Xwindows!")
+    nokbd=True
 import pickle
 #------------------------------------------------------------------------Declarations---------------------
 Trials = 100  # Number of epochs to wait for improvement in training
@@ -630,8 +635,9 @@ class GPUDBNN:
                     stop_training = True
             except AttributeError:
                 pass
-        #listener = keyboard.Listener(on_press=on_press)
-       # listener.start()
+        if not nokbd:
+            listener = keyboard.Listener(on_press=on_press)
+            listener.start()
         # Compute likelihood parameters
         self.likelihood_params = self._compute_pairwise_likelihood_parallel(
             X_train, y_train, X_train.shape[1]
@@ -702,7 +708,8 @@ class GPUDBNN:
                 print(f"No significant improvement for {patience} epochs. Early stopping.")
                 break
             if stop_training:
-                #listener.stop()
+                if not nokbd:
+                    listener.stop()
                 print("\nTraining interrupted by user")
                 break
 
@@ -782,7 +789,7 @@ class GPUDBNN:
 
     def save_predictions(self, X: pd.DataFrame, predictions: torch.Tensor, output_file: str, true_labels: pd.Series = None):
         """
-        Save predictions along with input data and probabilities to a CSV file and generate probability distribution plots
+        Save predictions along with input data and probabilities to a CSV file and generate visualization plots
         Args:
             X: Input DataFrame
             predictions: Model predictions
@@ -821,6 +828,16 @@ class GPUDBNN:
         # Add maximum probability column
         result_df['max_probability'] = all_probabilities.max(axis=1)
 
+        # Get runner-up information
+        top2_indices = np.argsort(all_probabilities, axis=1)[:, -2:]
+        runner_up_indices = top2_indices[:, 0]  # Second highest probability
+        runner_up_classes = self.label_encoder.inverse_transform(runner_up_indices)
+        runner_up_probs = np.array([all_probabilities[i, idx] for i, idx in enumerate(runner_up_indices)])
+
+        # Add runner-up information to DataFrame
+        result_df['runner_up_class'] = runner_up_classes
+        result_df['runner_up_probability'] = runner_up_probs
+
         if true_labels is not None:
             # Convert true labels to indices
             true_indices = self.label_encoder.transform(true_labels)
@@ -846,9 +863,31 @@ class GPUDBNN:
             print(f"Failed (true class prob <= {confidence_threshold:.3f} or not max prob): {n_failed}")
             print(f"Passed (true class prob > {confidence_threshold:.3f} and is max prob): {len(result_df) - n_failed}")
 
-        # Create probability distribution plots
-        import matplotlib.pyplot as plt
+            # Create confusion matrix
+            import matplotlib.pyplot as plt
+            import seaborn as sns
+            from sklearn.metrics import confusion_matrix
 
+            # Create confusion matrix
+            cm = confusion_matrix(true_labels, pred_labels)
+
+            # Create confusion matrix plot
+            plt.figure(figsize=(12, 10))
+            sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                       xticklabels=self.label_encoder.classes_,
+                       yticklabels=self.label_encoder.classes_)
+            plt.title('Confusion Matrix')
+            plt.xlabel('Predicted Label')
+            plt.ylabel('True Label')
+
+            # Save confusion matrix plot
+            confusion_matrix_file = output_file.rsplit('.', 1)[0] + '_confusion_matrix.png'
+            plt.savefig(confusion_matrix_file, bbox_inches='tight')
+            plt.close()
+
+            print(f"Saved confusion matrix plot to {confusion_matrix_file}")
+
+        # Create probability distribution plots
         # Create a figure with two subplots
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 12))
 
@@ -882,77 +921,6 @@ class GPUDBNN:
         result_df.to_csv(output_file, index=False)
         print(f"Saved predictions with probabilities to {output_file}")
         print(f"Saved probability distribution plots to {plot_file}")
-
-
-    def save_predictions_old(self, X: pd.DataFrame, predictions: torch.Tensor,
-                        output_file: str, true_labels: pd.Series = None):
-        """Save predictions and generate confusion matrix plot using best model weights"""
-        # Store current weights temporarily
-        temp_W = self.current_W
-
-        # Use best weights for evaluation
-        self.current_W = self.best_W.clone() if self.best_W is not None else self.current_W
-
-        try:
-            # Convert predictions to same type as true labels
-            if isinstance(predictions, torch.Tensor):
-                predictions = self.label_encoder.inverse_transform(predictions.cpu().numpy())
-
-            plt.figure(figsize=(15, 12))
-
-            # Enhanced confusion matrix
-            if true_labels is not None:
-                cm = confusion_matrix(true_labels, predictions)
-                class_labels = self.label_encoder.classes_
-
-                # Improved visualization
-                sns.heatmap(cm,
-                           annot=True,
-                           fmt='d',
-                           cmap='Blues',
-                           xticklabels=class_labels,
-                           yticklabels=class_labels,
-                           square=True,
-                           cbar_kws={'label': 'Count'})
-
-                plt.title('Confusion Matrix (Best Model)', pad=20)
-                plt.ylabel('True Label', labelpad=10)
-                plt.xlabel('Predicted Label', labelpad=10)
-
-                # Rotate labels for better readability
-                plt.xticks(rotation=45, ha='right')
-                plt.yticks(rotation=0)
-
-                plt.tight_layout()
-                plt.savefig(output_file.replace('.csv', '_confusion_matrix.png'),
-                           dpi=300,
-                           bbox_inches='tight',
-                           facecolor='white',
-                           edgecolor='none')
-                plt.close()
-
-                # Save predictions and metrics to CSV
-                results_df = pd.DataFrame({
-                    'True_Label': true_labels,
-                    'Predicted_Label': predictions
-                })
-                results_df.to_csv(output_file, index=False)
-
-                # Add model performance metrics
-                metrics_file = output_file.replace('.csv', '_metrics.txt')
-                accuracy = accuracy_score(true_labels, predictions)
-                with open(metrics_file, 'w') as f:
-                    f.write("Best Model Performance Metrics\n")
-                    f.write("=" * 50 + "\n\n")
-                    f.write(f"Overall Accuracy: {accuracy:.4f}\n\n")
-                    f.write("Classification Report:\n")
-                    f.write(classification_report(true_labels, predictions))
-                    f.write("\nConfusion Matrix:\n")
-                    f.write(str(cm))
-        finally:
-            # Restore current weights
-            self.current_W = temp_W
-
 
 #------------------------------------------------------------End of PP code ---------------------------------------------------
     def _compute_pairwise_likelihood(self, dataset, labels, feature_dims):
