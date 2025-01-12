@@ -2,6 +2,7 @@ import torch
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.metrics import classification_report, confusion_matrix
 import matplotlib.pyplot as plt
@@ -24,6 +25,7 @@ import pickle
 #------------------------------------------------------------------------Declarations---------------------
 Trials = 100  # Number of epochs to wait for improvement in training
 cardinality_threshold =0.9
+cardinality_tolerance=4 #Use when the features are likely to be extremly diverse and deciimal values;4 means, precison restricted to 4 decimal places
 LearningRate =0.1
 TrainingRandomSeed=42  #None # 42
 Epochs=1000
@@ -295,6 +297,7 @@ class GPUDBNN:
 
 
     def _remove_high_cardinality_columns(self, df: pd.DataFrame, threshold: float = 0.8) -> pd.DataFrame:
+        df=df.round(cardinality_tolerance)
         """
         Remove columns with unique values exceeding the threshold percentage
 
