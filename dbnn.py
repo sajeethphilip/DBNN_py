@@ -521,15 +521,25 @@ class GPUDBNN:
 
 
     def predict(self, X: torch.Tensor, batch_size: int = 32):
-        """Make predictions in batches"""
+        """Make predictions in batches using the best model weights"""
+        # Store current weights temporarily
+        temp_W = self.current_W
+
+        # Use best weights for prediction
+        self.current_W = self.best_W.clone() if self.best_W is not None else self.current_W
+
         X = X.to(self.device)
         predictions = []
 
-        for i in range(0, len(X), batch_size):
-            batch_X = X[i:min(i + batch_size, len(X))]
-            posteriors = self._compute_batch_posterior(batch_X)
-            batch_predictions = torch.argmax(posteriors, dim=1)
-            predictions.append(batch_predictions)
+        try:
+            for i in range(0, len(X), batch_size):
+                batch_X = X[i:min(i + batch_size, len(X))]
+                posteriors = self._compute_batch_posterior(batch_X)
+                batch_predictions = torch.argmax(posteriors, dim=1)
+                predictions.append(batch_predictions)
+        finally:
+            # Restore current weights
+            self.current_W = temp_W
 
         return torch.cat(predictions).cpu()
 
@@ -607,6 +617,7 @@ class GPUDBNN:
         train_accuracies=[]
         test_accuracies=[]
         stop_training=False
+        patience_counter = 0  # Initialize patience counter here
         # Start keyboard listener
         def on_press(key):
             nonlocal stop_training
@@ -767,37 +778,72 @@ class GPUDBNN:
 
     def save_predictions(self, X: pd.DataFrame, predictions: torch.Tensor,
                         output_file: str, true_labels: pd.Series = None):
-        plt.figure(figsize=(15, 12))
+        """Save predictions and generate confusion matrix plot using best model weights"""
+        # Store current weights temporarily
+        temp_W = self.current_W
 
-        # Enhanced confusion matrix
-        cm = confusion_matrix(true_labels, predictions)
-        class_labels = self.label_encoder.classes_
+        # Use best weights for evaluation
+        self.current_W = self.best_W.clone() if self.best_W is not None else self.current_W
 
-        # Improved visualization
-        sns.heatmap(cm,
-                    annot=True,
-                    fmt='d',
-                    cmap='Blues',
-                    xticklabels=class_labels,
-                    yticklabels=class_labels,
-                    square=True,  # Make cells square
-                    cbar_kws={'label': 'Count'})
+        try:
+            # Convert predictions to same type as true labels
+            if isinstance(predictions, torch.Tensor):
+                predictions = self.label_encoder.inverse_transform(predictions.cpu().numpy())
 
-        plt.title('Confusion Matrix', pad=20)
-        plt.ylabel('True Label', labelpad=10)
-        plt.xlabel('Predicted Label', labelpad=10)
+            plt.figure(figsize=(15, 12))
 
-        # Rotate labels for better readability
-        plt.xticks(rotation=45, ha='right')
-        plt.yticks(rotation=0)
+            # Enhanced confusion matrix
+            if true_labels is not None:
+                cm = confusion_matrix(true_labels, predictions)
+                class_labels = self.label_encoder.classes_
 
-        plt.tight_layout()
-        plt.savefig(output_file.replace('.csv', '_confusion_matrix.png'),
-                    dpi=300,
-                    bbox_inches='tight',
-                    facecolor='white',
-                    edgecolor='none')
-        plt.close()
+                # Improved visualization
+                sns.heatmap(cm,
+                           annot=True,
+                           fmt='d',
+                           cmap='Blues',
+                           xticklabels=class_labels,
+                           yticklabels=class_labels,
+                           square=True,
+                           cbar_kws={'label': 'Count'})
+
+                plt.title('Confusion Matrix (Best Model)', pad=20)
+                plt.ylabel('True Label', labelpad=10)
+                plt.xlabel('Predicted Label', labelpad=10)
+
+                # Rotate labels for better readability
+                plt.xticks(rotation=45, ha='right')
+                plt.yticks(rotation=0)
+
+                plt.tight_layout()
+                plt.savefig(output_file.replace('.csv', '_confusion_matrix.png'),
+                           dpi=300,
+                           bbox_inches='tight',
+                           facecolor='white',
+                           edgecolor='none')
+                plt.close()
+
+                # Save predictions and metrics to CSV
+                results_df = pd.DataFrame({
+                    'True_Label': true_labels,
+                    'Predicted_Label': predictions
+                })
+                results_df.to_csv(output_file, index=False)
+
+                # Add model performance metrics
+                metrics_file = output_file.replace('.csv', '_metrics.txt')
+                accuracy = accuracy_score(true_labels, predictions)
+                with open(metrics_file, 'w') as f:
+                    f.write("Best Model Performance Metrics\n")
+                    f.write("=" * 50 + "\n\n")
+                    f.write(f"Overall Accuracy: {accuracy:.4f}\n\n")
+                    f.write("Classification Report:\n")
+                    f.write(classification_report(true_labels, predictions))
+                    f.write("\nConfusion Matrix:\n")
+                    f.write(str(cm))
+        finally:
+            # Restore current weights
+            self.current_W = temp_W
 
 
 #------------------------------------------------------------End of PP code ---------------------------------------------------
@@ -1233,9 +1279,7 @@ class GPUDBNN:
 
 
     def predict_and_save(self, save_path=None, batch_size: int = 32):
-        """
-        Make predictions on data and optionally save them
-        """
+        """Make predictions on data and save them using best model weights"""
         try:
             # First try to load existing model and components
             weights_loaded = os.path.exists(self._get_weights_filename())
@@ -1250,70 +1294,37 @@ class GPUDBNN:
             self._load_best_weights()
             self._load_categorical_encoders()
 
-            # Set current_W to best_W for prediction
-            self.current_W = self.best_W.clone() if self.best_W is not None else None
-
-            if self.current_W is None:
-                print("No weights loaded. Training required.")
+            # Explicitly use best weights for prediction
+            if self.best_W is None:
+                print("No best weights found. Training required.")
                 results = self.fit_predict(batch_size=batch_size)
                 return results
 
-            # Load and preprocess input data
-            X = self.data.drop(columns=[self.target_column])
-            true_labels = self.data[self.target_column]
+            # Store current weights temporarily
+            temp_W = self.current_W
 
-            # Preprocess the data using the existing method
-            X_tensor = self._preprocess_data(X, is_training=False)
+            # Use best weights for prediction
+            self.current_W = self.best_W.clone()
 
-            # Make predictions
-            predictions = self.predict(X_tensor, batch_size=batch_size)
+            try:
+                # Load and preprocess input data
+                X = self.data.drop(columns=[self.target_column])
+                true_labels = self.data[self.target_column]
 
-            # Calculate and save metrics if true labels are available
-            if self.target_column in self.data.columns:
-                y_true = self.label_encoder.transform(true_labels.values)
-                y_pred = predictions.cpu().numpy()
+                # Preprocess the data using the existing method
+                X_tensor = self._preprocess_data(X, is_training=False)
 
-                metrics = {
-                    'classification_report': classification_report(true_labels,
-                        self.label_encoder.inverse_transform(y_pred)),
-                    'confusion_matrix': confusion_matrix(true_labels,
-                        self.label_encoder.inverse_transform(y_pred)),
-                    'accuracy': (y_pred == y_true).mean()
-                }
+                # Make predictions
+                predictions = self.predict(X_tensor, batch_size=batch_size)
 
-                # Save metrics to file
+                # Save predictions and metrics
                 if save_path:
-                    metrics_file = save_path.replace('.csv', '_metrics.txt')
-                    with open(metrics_file, 'w') as f:
-                        f.write("Model Performance Metrics\n")
-                        f.write("="*50 + "\n\n")
-                        f.write(f"Overall Accuracy: {metrics['accuracy']:.4f}\n\n")
-                        f.write("Classification Report:\n")
-                        f.write(metrics['classification_report'])
-                        f.write("\nConfusion Matrix:\n")
-                        f.write(str(metrics['confusion_matrix']))
+                    self.save_predictions(X, predictions, save_path, true_labels)
 
-                    # Plot confusion matrix
-                    plt.figure(figsize=(10, 8))
-                    sns.heatmap(
-                        metrics['confusion_matrix'],
-                        annot=True,
-                        fmt='d',
-                        cmap='Blues',
-                        xticklabels=self.label_encoder.classes_,
-                        yticklabels=self.label_encoder.classes_
-                    )
-                    plt.title('Confusion Matrix')
-                    plt.ylabel('True Label')
-                    plt.xlabel('Predicted Label')
-                    plt.savefig(save_path.replace('.csv', '_confusion_matrix.png'))
-                    plt.close()
-
-            # Save predictions if path is provided
-            if save_path:
-                self.save_predictions(X, predictions, save_path, true_labels)
-
-            return predictions
+                return predictions
+            finally:
+                # Restore current weights
+                self.current_W = temp_W
 
         except Exception as e:
             print(f"Error during prediction process: {str(e)}")
