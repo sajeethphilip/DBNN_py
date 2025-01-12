@@ -20,13 +20,46 @@ from scipy.stats import normaltest
 import numpy as np
 from itertools import combinations
 import torch
-try:
-    from pynput import keyboard
-    nokbd=False
-except:
-    print("Keyboard control using q key for skipping training is not supported without Xwindows!")
-    nokbd=True
+import os
 import pickle
+
+# Assume no keyboard control on Linux servers
+nokbd = True
+if os.name == 'nt' or 'darwin' in os.uname()[0].lower():  # Windows or MacOS
+    try:
+        from pynput import keyboard
+        nokbd = False
+    except:
+        print("Could not initialize keyboard control")
+else:
+    # Check if X server is available on Linux
+    def is_x11_available():
+        if os.name != 'posix':  # Not Linux/Unix
+            return True
+
+        # Check if DISPLAY environment variable is set
+        if 'DISPLAY' not in os.environ:
+            return False
+
+        # Optional: You could also try a lightweight X11 connection test
+        try:
+            import subprocess
+            subprocess.run(['xset', 'q'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        except:
+            return False
+
+    # Only try to import pynput if X11 is available
+    nokbd = True
+    if is_x11_available():
+        try:
+            from pynput import keyboard
+            nokbd = False
+        except:
+            print("Could not initialize keyboard control despite X11 being available")
+    else:
+        print("Keyboard control using q key for skipping training is not supported without X11!")
+
 #------------------------------------------------------------------------Declarations---------------------
 Trials = 100  # Number of epochs to wait for improvement in training
 cardinality_threshold =0.9
@@ -35,7 +68,7 @@ LearningRate =0.1
 TrainingRandomSeed=42  #None # 42
 Epochs=1000
 TestFraction=0.2
-Train=False #True #True #
+Train=True #True #False #
 Train_only=False #True #
 Predict=True
 Gen_Samples=False
