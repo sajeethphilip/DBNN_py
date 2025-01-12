@@ -20,7 +20,7 @@ from scipy.stats import normaltest
 import numpy as np
 from itertools import combinations
 import torch
-from pynput import keyboard
+#from pynput import keyboard
 import pickle
 #------------------------------------------------------------------------Declarations---------------------
 Trials = 100  # Number of epochs to wait for improvement in training
@@ -30,9 +30,10 @@ LearningRate =0.1
 TrainingRandomSeed=42  #None # 42
 Epochs=1000
 TestFraction=0.2
-Train=True #False #True #
+Train=False #True #True #
 Train_only=False #True #
 Predict=True
+Gen_Samples=False
 #----------------------------------------------------------------------------------------------------------------
 class DatasetConfig:
     """Handle dataset configuration loading and validation"""
@@ -629,8 +630,8 @@ class GPUDBNN:
                     stop_training = True
             except AttributeError:
                 pass
-        listener = keyboard.Listener(on_press=on_press)
-        listener.start()
+        #listener = keyboard.Listener(on_press=on_press)
+       # listener.start()
         # Compute likelihood parameters
         self.likelihood_params = self._compute_pairwise_likelihood_parallel(
             X_train, y_train, X_train.shape[1]
@@ -701,7 +702,7 @@ class GPUDBNN:
                 print(f"No significant improvement for {patience} epochs. Early stopping.")
                 break
             if stop_training:
-                listener.stop()
+                #listener.stop()
                 print("\nTraining interrupted by user")
                 break
 
@@ -779,7 +780,111 @@ class GPUDBNN:
 
         plt.close()
 
-    def save_predictions(self, X: pd.DataFrame, predictions: torch.Tensor,
+    def save_predictions(self, X: pd.DataFrame, predictions: torch.Tensor, output_file: str, true_labels: pd.Series = None):
+        """
+        Save predictions along with input data and probabilities to a CSV file and generate probability distribution plots
+        Args:
+            X: Input DataFrame
+            predictions: Model predictions
+            output_file: Path to save the CSV file
+            true_labels: Ground truth labels if available
+        """
+        # Move tensors to CPU for numpy operations
+        predictions = predictions.cpu()
+        # Create result DataFrame with input data
+        result_df = X.copy()
+        # Convert predictions to original class labels
+        pred_labels = self.label_encoder.inverse_transform(predictions.numpy())
+        result_df['predicted_class'] = pred_labels
+        # Add ground truth if available
+        if true_labels is not None:
+            result_df['true_class'] = true_labels
+        # Get the preprocessed features for probability computation
+        X_processed = self._preprocess_data(X, is_training=False)
+        X_tensor = torch.FloatTensor(X_processed).to(self.device)
+        # Compute probabilities in batches
+        batch_size = 32
+        all_probabilities = []
+        for i in range(0, len(X_tensor), batch_size):
+            batch_end = min(i + batch_size, len(X_tensor))
+            batch_X = X_tensor[i:batch_end]
+            # Get probabilities for this batch
+            batch_probs = self._compute_batch_posterior(batch_X)
+            all_probabilities.append(batch_probs.cpu().numpy())
+        # Combine all batch probabilities
+        all_probabilities = np.vstack(all_probabilities)
+
+        # Add probability columns for each class
+        for i, class_name in enumerate(self.label_encoder.classes_):
+            result_df[f'prob_{class_name}'] = all_probabilities[:, i]
+
+        # Add maximum probability column
+        result_df['max_probability'] = all_probabilities.max(axis=1)
+
+        if true_labels is not None:
+            # Convert true labels to indices
+            true_indices = self.label_encoder.transform(true_labels)
+            # Get the probabilities for true classes
+            true_probs = all_probabilities[np.arange(len(true_indices)), true_indices]
+            # Check if true class has the highest probability
+            max_prob_indices = np.argmax(all_probabilities, axis=1)
+            correct_prediction = (true_indices == max_prob_indices)
+
+            # Add confidence-based pass/fail label
+            n_classes = len(self.label_encoder.classes_)
+            confidence_threshold = 1.0 / n_classes
+            result_df['confidence_check'] = np.where(
+                (true_probs >= confidence_threshold) & correct_prediction,
+                'Passed',
+                'Failed'
+            )
+
+            # Print summary statistics
+            n_failed = (result_df['confidence_check'] == 'Failed').sum()
+            print(f"\nConfidence Check Summary:")
+            print(f"Total predictions: {len(result_df)}")
+            print(f"Failed (true class prob <= {confidence_threshold:.3f} or not max prob): {n_failed}")
+            print(f"Passed (true class prob > {confidence_threshold:.3f} and is max prob): {len(result_df) - n_failed}")
+
+        # Create probability distribution plots
+        import matplotlib.pyplot as plt
+
+        # Create a figure with two subplots
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 12))
+
+        # Plot 1: Overall maximum probability distribution
+        ax1.hist(result_df['max_probability'], bins=50, color='lightblue', edgecolor='black')
+        ax1.axvline(x=confidence_threshold, color='red', linestyle='--', label='Confidence Threshold')
+        ax1.set_title('Distribution of Maximum Prediction Probabilities')
+        ax1.set_xlabel('Maximum Probability')
+        ax1.set_ylabel('Count')
+        ax1.legend()
+
+        # Plot 2: Distribution for each class
+        for i, class_name in enumerate(self.label_encoder.classes_):
+            prob_col = f'prob_{class_name}'
+            ax2.hist(result_df[prob_col], bins=50, alpha=0.5, label=class_name)
+
+        ax2.axvline(x=confidence_threshold, color='red', linestyle='--', label='Confidence Threshold')
+        ax2.set_title('Distribution of Prediction Probabilities by Class')
+        ax2.set_xlabel('Probability')
+        ax2.set_ylabel('Count')
+        ax2.legend()
+
+        plt.tight_layout()
+
+        # Save the plots
+        plot_file = output_file.rsplit('.', 1)[0] + '_probability_distributions.png'
+        plt.savefig(plot_file)
+        plt.close()
+
+        # Save to CSV
+        result_df.to_csv(output_file, index=False)
+        print(f"Saved predictions with probabilities to {output_file}")
+        print(f"Saved probability distribution plots to {plot_file}")
+
+
+    def save_predictions_old(self, X: pd.DataFrame, predictions: torch.Tensor,
                         output_file: str, true_labels: pd.Series = None):
         """Save predictions and generate confusion matrix plot using best model weights"""
         # Store current weights temporarily
@@ -1459,25 +1564,27 @@ def generate_test_datasets():
 
 
 if __name__ == "__main__":
-    # Generate test datasets
-    generate_test_datasets()
+    if Gen_Samples:
 
-    # Test XOR and 3D XOR
-    test_datasets = ['xor', 'xor3d']
-    for dataset in test_datasets:
-        try:
-            print(f"\nTesting {dataset} dataset...")
-            model = GPUDBNN(dataset_name=dataset)
-            if Train:
-                model, results = run_gpu_benchmark(dataset)
-                print(f"Test Accuracy: {results['test_accuracy']:.4f}")
-            if Predict:
-                predictions = model.predict_and_save(save_path=f"{dataset}_predictions.csv")
-        except Exception as e:
-            print(f"Error testing {dataset}: {str(e)}")
+            # Generate test datasets
+            generate_test_datasets()
 
-    # Print available datasets
-    print("Available datasets:", ", ".join(DatasetConfig.get_available_datasets()))
+            # Test XOR and 3D XOR
+            test_datasets = ['xor', 'xor3d']
+            for dataset in test_datasets:
+                try:
+                    print(f"\nTesting {dataset} dataset...")
+                    model = GPUDBNN(dataset_name=dataset)
+                    if Train:
+                        model, results = run_gpu_benchmark(dataset)
+                        print(f"Test Accuracy: {results['test_accuracy']:.4f}")
+                    if Predict:
+                        predictions = model.predict_and_save(save_path=f"{dataset}_predictions.csv")
+                except Exception as e:
+                    print(f"Error testing {dataset}: {str(e)}")
+
+            # Print available datasets
+            print("Available datasets:", ", ".join(DatasetConfig.get_available_datasets()))
 
     # Example: Run benchmark on available datasets
     datasets_to_test = DatasetConfig.get_available_datasets()
