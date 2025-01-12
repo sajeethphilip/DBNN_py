@@ -7,3 +7,5 @@ You can generate config files for UCI data (that can be used as an example) and 
 Add a # to the configure file features before the feature names to exclude any feature from the computation. By default, any repetitions with high cardinality will be filtered out.
 
 By default, the Imposed conditional independence is assumed on pairs of features ("feature_group_size": 2) but can be edited in the conf file to any number equal/less than the total number of features.
+
+Press "q" or "Q" key during training to interrupt training and go to the next stage.
