@@ -19,6 +19,8 @@ from scipy.stats import normaltest
 import numpy as np
 from itertools import combinations
 import torch
+from pynput import keyboard
+import pickle
 #------------------------------------------------------------------------Declarations---------------------
 Trials = 100  # Number of epochs to wait for improvement in training
 cardinality_threshold =0.9
@@ -593,12 +595,28 @@ class GPUDBNN:
                 print(f"Warning: Could not load weights from {weights_file}: {str(e)}")
                 self.best_W = None
 
-    def train(self, X_train: torch.Tensor, y_train: torch.Tensor, batch_size: int = 32):
+    def train(self, X_train: torch.Tensor, y_train: torch.Tensor, X_test: torch.Tensor, y_test: torch.Tensor,batch_size: int = 32):
         """Train the model using batch processing"""
         # Move data to device
         X_train = X_train.to(self.device)
         y_train = y_train.to(self.device)
-
+        X_test = X_test.to(self.device)
+        y_test = y_test.to(self.device)
+        train_losses=[]
+        test_losses=[]
+        train_accuracies=[]
+        test_accuracies=[]
+        stop_training=False
+        # Start keyboard listener
+        def on_press(key):
+            nonlocal stop_training
+            try:
+                if key.char in ('q', 'Q'):
+                    stop_training = True
+            except AttributeError:
+                pass
+        listener = keyboard.Listener(on_press=on_press)
+        listener.start()
         # Compute likelihood parameters
         self.likelihood_params = self._compute_pairwise_likelihood_parallel(
             X_train, y_train, X_train.shape[1]
@@ -652,7 +670,6 @@ class GPUDBNN:
             error_rates.append(error_rate)
 
             print(f"Epoch {epoch + 1}: Error rate = {error_rate:.4f}")
-
             # Update best weights if improved
             if error_rate <= self.best_error:
                 improvement = self.best_error - error_rate
@@ -665,10 +682,13 @@ class GPUDBNN:
                     patience_counter = 0
             else:
                 patience_counter += 1
-
             # Early stopping with patience
             if patience_counter >= patience:
                 print(f"No significant improvement for {patience} epochs. Early stopping.")
+                break
+            if stop_training:
+                listener.stop()
+                print("\nTraining interrupted by user")
                 break
 
             if n_errors == 0:
@@ -677,8 +697,73 @@ class GPUDBNN:
 
             if failed_cases:
                 self._update_priors_parallel(failed_cases, batch_size)
+            # Calculate training metrics
+            train_loss = n_errors / n_samples
+            train_pred = self.predict(X_train, batch_size)
+            train_acc = (train_pred == y_train.cpu()).float().mean()
+
+            # Calculate test metrics if test data provided
+            if X_test is not None and y_test is not None:
+                test_pred = self.predict(X_test, batch_size)
+                test_loss = (test_pred != y_test.cpu()).float().mean()
+                test_acc = (test_pred == y_test.cpu()).float().mean()
+            else:
+                test_loss = train_loss
+                test_acc = train_acc
+
+            # Store metrics
+            train_losses.append(train_loss)
+            test_losses.append(test_loss)
+            train_accuracies.append(train_acc)
+            test_accuracies.append(test_acc)
+            # Plot metrics every epoch
+            self.plot_training_metrics(
+                train_losses, test_losses,
+                train_accuracies, test_accuracies,
+                save_path=f'{self.dataset_name}_training_metrics.png'
+            )
         self._save_model_components()
         return self.current_W.cpu(), error_rates
+
+    def plot_training_metrics(self, train_loss, test_loss, train_acc, test_acc, save_path=None):
+        """Plot training and testing metrics over epochs"""
+        plt.figure(figsize=(12, 8))
+
+        # Plot loss
+        plt.subplot(2, 1, 1)
+        plt.plot(train_loss, label='Train Loss', marker='o')
+        plt.plot(test_loss, label='Test Loss', marker='o')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.title('Loss Over Epochs')
+        plt.legend()
+        plt.grid(True)
+
+        # Plot accuracy
+        plt.subplot(2, 1, 2)
+        plt.plot(train_acc, label='Train Accuracy', marker='o')
+        plt.plot(test_acc, label='Test Accuracy', marker='o')
+        plt.xlabel('Epoch')
+        plt.ylabel('Accuracy')
+        plt.title('Accuracy Over Epochs')
+        plt.legend()
+        plt.grid(True)
+
+        plt.tight_layout()
+
+        if save_path:
+            plt.savefig(save_path)
+            # Also save metrics to CSV
+            metrics_df = pd.DataFrame({
+                'epoch': range(1, len(train_loss) + 1),
+                'train_loss': train_loss,
+                'test_loss': test_loss,
+                'train_accuracy': train_acc,
+                'test_accuracy': test_acc
+            })
+            metrics_df.to_csv(save_path.replace('.png', '_metrics.csv'), index=False)
+
+        plt.close()
 
     def save_predictions(self, X: pd.DataFrame, predictions: torch.Tensor,
                         output_file: str, true_labels: pd.Series = None):
@@ -755,29 +840,7 @@ class GPUDBNN:
         return os.path.join('Model', f'Best_{self.dataset_name}_encoders.json')
 
 
-    def _save_categorical_encoders(self):
-        """Save categorical feature encoders to file"""
-        if self.categorical_encoders:
-            encoders_dict = {
-                column: {str(k): int(v) for k, v in mapping.items()}
-                for column, mapping in self.categorical_encoders.items()
-            }
 
-            with open(self._get_encoders_filename(), 'w') as f:
-                json.dump(encoders_dict, f)
-
-    def _load_categorical_encoders(self):
-        """Load categorical feature encoders from file if they exist"""
-        encoders_file = self._get_encoders_filename()
-        if os.path.exists(encoders_file):
-            with open(encoders_file, 'r') as f:
-                encoders_dict = json.load(f)
-
-            self.categorical_encoders = {
-                column: {k: int(v) for k, v in mapping.items()}
-                for column, mapping in encoders_dict.items()
-            }
-            print(f"Loaded categorical encoders from {encoders_file}")
 
     def _detect_categorical_columns(self, df: pd.DataFrame) -> List[str]:
         """Detect categorical columns in the dataset"""
@@ -1008,7 +1071,7 @@ class GPUDBNN:
         y_test = torch.LongTensor(y_test).to(self.device)
 
         # Train model
-        final_W, error_rates = self.train(X_train, y_train, batch_size=batch_size)
+        final_W, error_rates = self.train(X_train, y_train,X_test, y_test, batch_size=batch_size)
 
         # Save categorical encoders
         self._save_categorical_encoders()
@@ -1050,30 +1113,64 @@ class GPUDBNN:
         return os.path.join('Model', f'Best_{self.dataset_name}_components.pkl')
 #----------------Handling categorical variables across sessions -------------------------
     def _save_categorical_encoders(self):
+        """Save categorical feature encoders"""
         if self.categorical_encoders:
+            # Create a serializable dictionary structure
             encoders_dict = {
-                column: {
-                    str(k): int(v) for k, v in mapping.items()
-                } for column, mapping in self.categorical_encoders.items()
+                'encoders': {
+                    column: {
+                        str(k): v for k, v in mapping.items()
+                    } for column, mapping in self.categorical_encoders.items()
+                }
             }
-            metadata = {
-                'encoders': encoders_dict,
-                'timestamp': pd.Timestamp.now().isoformat(),
-                'column_types': {col: str(dtype) for col, dtype in self.original_columns.items()}
-            }
+
+            # Add metadata
+            if hasattr(self, 'original_columns'):
+                if isinstance(self.original_columns, list):
+                    column_types = {col: str(self.data[col].dtype) for col in self.original_columns if col in self.data.columns}
+                else:
+                    column_types = {col: str(dtype) for col, dtype in self.original_columns.items()}
+
+                encoders_dict['metadata'] = {
+                    'column_types': column_types,
+                    'timestamp': pd.Timestamp.now().isoformat()
+                }
+
             with open(self._get_encoders_filename(), 'w') as f:
-                json.dump(metadata, f, indent=2)
+                json.dump(encoders_dict, f, indent=2)
 
     def _load_categorical_encoders(self):
         """Load categorical feature encoders from file"""
         encoders_file = self._get_encoders_filename()
         if os.path.exists(encoders_file):
-            with open(encoders_file, 'r') as f:
-                encoders_dict = json.load(f)
-                self.categorical_encoders = {
-                    column: {k: int(v) for k, v in mapping.items()}
-                    for column, mapping in encoders_dict.items()
-                }
+            try:
+                with open(encoders_file, 'r') as f:
+                    data = json.load(f)
+
+                # Extract encoders from the loaded data
+                if 'encoders' in data:
+                    self.categorical_encoders = {
+                        column: {
+                            k: int(v) if isinstance(v, (str, int, float)) else v
+                            for k, v in mapping.items()
+                        }
+                        for column, mapping in data['encoders'].items()
+                    }
+                else:
+                    # Handle legacy format where encoders were at top level
+                    self.categorical_encoders = {
+                        column: {
+                            k: int(v) if isinstance(v, (str, int, float)) else v
+                            for k, v in mapping.items()
+                        }
+                        for column, mapping in data.items()
+                    }
+
+                print(f"Loaded categorical encoders from {encoders_file}")
+            except Exception as e:
+                print(f"Warning: Failed to load categorical encoders: {str(e)}")
+                self.categorical_encoders = {}
+
     def _encode_categorical_features(self, df: pd.DataFrame, is_training: bool = True):
         df_encoded = df.copy()
         categorical_columns = self._detect_categorical_columns(df)
@@ -1372,7 +1469,7 @@ if __name__ == "__main__":
     datasets_to_test = DatasetConfig.get_available_datasets()
 
     for dataset in datasets_to_test:
-        try:
+        #try:
             model = GPUDBNN(dataset_name=dataset)
             if Train:
                 model, results = run_gpu_benchmark(dataset)
@@ -1382,5 +1479,5 @@ if __name__ == "__main__":
                 predictions = model.predict_and_save(save_path=f"{dataset}_predictions.csv")
             print(f"\nCompleted benchmark for {dataset}")
             print("-" * 50)
-        except:
-            print(f"Skipping data {dataset} as it ran into error while training/testing..")
+        #except:
+         #   print(f"Skipping data {dataset} as it ran into error while training/testing..")
