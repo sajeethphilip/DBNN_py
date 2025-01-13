@@ -24,7 +24,7 @@ The key components of the adaptive learning process are:
 
 **Training Phase**
 1. The model trains on the current training set
-2. The remaining data becomes the test set (using a boolean mask: `test_mask = ~train_mask`)[1]
+2. The remaining data becomes the test set (using a boolean mask: `test_mask = ~train_mask`)
 3. Predictions are made on this test set
 
 **Selection Process**
