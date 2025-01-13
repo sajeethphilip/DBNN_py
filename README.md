@@ -8,6 +8,60 @@ Add a # to the configure file features before the feature names to exclude any f
 
 By default, the Imposed conditional independence is assumed on pairs of features ("feature_group_size": 2) but can be edited in the conf file to any number equal/less than the total number of features.
 
-Press "q" or "Q" key during training to interrupt training and go to the next stage.
+Press the "q" or "Q" key during training to interrupt training and go to the next stage.
 
 The older version of the C++ code used space as the separator, which is not ideal. space2csv.py function can convert the file into CSV.
+
+# Adaptive Learning
+
+The adaptive learning process in the code follows a specific strategy for including new examples based on misclassifications. Here's how it works:
+
+## Initial Training Set Creation
+The process starts by selecting one example per class from the dataset to form the initial training set[1]. This ensures the representation of all classes from the beginning.
+
+## Adaptive Learning Loop
+The key components of the adaptive learning process are:
+
+**Training Phase**
+1. The model trains on the current training set
+2. The remaining data becomes the test set (using a boolean mask: `test_mask = ~train_mask`)[1]
+3. Predictions are made on this test set
+
+**Selection Process**
+For each misclassified example in the test set, the code:
+1. Group misclassifications by predicted class
+2. For each class where misclassifications occurred, it selects the example with the highest prediction probability
+3. These selected examples are then added to the training set for the next iteration
+
+**Stopping Criteria**
+The process continues until either:
+- All examples are correctly classified
+- No improvement is seen for 3 consecutive rounds
+- The maximum number of rounds is reached
+
+## Code Implementation
+Here's the key section that handles the selection:
+
+```python
+# Find misclassified examples
+misclassified_mask = (predictions != true_labels)
+misclassified_indices = np.where(misclassified_mask)[0]
+
+# Select the most confident misclassifications
+new_train_indices = []
+for class_idx, class_label in enumerate(unique_classes):
+    # Find misclassified examples predicted as this class
+    class_mask = (predictions == class_label) & misclassified_mask
+    if np.any(class_mask):
+        # Get probabilities for predicted class
+        class_probs = predictions_df[prob_col].values[class_mask]
+        max_prob_idx = np.argmax(class_probs)
+        # Map back to original dataset index
+        original_idx = test_indices[np.where(class_mask)[0][max_prob_idx]]
+        new_train_indices.append(original_idx)
+```
+
+This confirms that adaptive learning is indeed happening on the test set (data not used for training), as evidenced by:
+1. The explicit creation of test indices using the complement of training mask
+2. The selection of new examples only from the test set indices
+3. The mapping back to original dataset indices when adding new examples to the training set
