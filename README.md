@@ -11,6 +11,66 @@ By default, the Imposed conditional independence is assumed on pairs of features
 Press the "q" or "Q" key during training to interrupt training and go to the next stage.
 
 The older version of the C++ code used space as the separator, which is not ideal. space2csv.py function can convert the file into CSV.
+Let me break down the key components of this GPU-optimized Deep Bayesian Neural Network (DBNN) implementation.
+
+## Core Components
+
+**Dataset Configuration**
+- Handles dataset loading and configuration through JSON files
+- Validates required fields and provides default configurations
+- Supports both local and URL-based dataset loading
+- Filters features based on configuration settings
+
+**Data Preprocessing**
+- Handles categorical feature encoding
+- Removes high cardinality columns based on threshold
+- Applies standard scaling to numerical features
+- Preserves feature order and handles missing columns
+
+**Model Architecture**
+The DBNN implementation includes:
+
+**Likelihood Computation**
+- Computes multivariate normal PDFs for feature pairs
+- Uses GPU-optimized tensor operations for parallel processing
+- Maintains numerical stability through epsilon values
+
+**Training Process**
+1. Initializes weights for each class and feature pair
+2. Computes posterior probabilities in batches
+3. Updates weights based on misclassifications
+4. Implements early stopping based on error rates
+
+## Supporting Features
+
+**Model Persistence**
+- Saves and loads model weights
+- Stores categorical encoders
+- Preserves model components between sessions
+
+**Visualization**
+- Generates confusion matrices
+- Plots training progress
+- Creates probability distribution visualizations
+
+**Performance Optimization**
+- Utilizes GPU acceleration when available
+- Implements batch processing for memory efficiency
+- Provides parallel computation of likelihoods
+
+## Utility Functions
+
+**Benchmarking**
+- Runs performance tests on datasets
+- Generates test datasets (XOR, 3D XOR)
+- Reports classification metrics
+
+**Error Handling**
+- Validates input data
+- Provides fallback mechanisms
+- Implements graceful degradation when GPU is unavailable
+
+The code follows a modular design pattern with a clear separation of concerns between data handling, model training, and evaluation components.
 
 # Adaptive Learning
 
