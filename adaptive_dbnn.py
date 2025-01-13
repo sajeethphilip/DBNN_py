@@ -460,6 +460,22 @@ class GPUDBNN:
                 rounds_without_improvement += 1
                 if rounds_without_improvement >= 3:
                     print("No improvement for 3 rounds. Stopping early.")
+                    # Select most confident misclassifications
+                    new_train_indices = []
+                    for class_idx, class_label in enumerate(unique_classes):
+                        # Find misclassified examples predicted as this class
+                        class_mask = (predictions == class_label) & misclassified_mask
+                        if np.any(class_mask):
+                            # Get probabilities for predicted class using original class label
+                            original_class = original_classes[class_idx]
+                            prob_col = f'prob_{original_class}'
+                            class_probs = predictions_df[prob_col].values[class_mask]
+                            max_prob_idx = np.argmax(class_probs)
+                            # Map back to original dataset index
+                            original_idx = test_indices[np.where(class_mask)[0][max_prob_idx]]
+                            new_train_indices.append(original_idx)
+
+                    train_indices.extend(new_train_indices)
                     continue
 
             if len(misclassified_indices) == 0:
@@ -864,7 +880,10 @@ class GPUDBNN:
 
         n_samples = len(X_train)
         error_rates = []
-        patience = Trials  # Number of epochs to wait for improvement
+        if self.in_adaptive_fit:
+             patience = 3
+        else:
+            patience = Trials  # Number of epochs to wait for improvement
         for epoch in range(self.max_epochs):
             failed_cases = []
             n_errors = 0
@@ -1634,14 +1653,14 @@ class GPUDBNN:
             results = self.fit_predict(batch_size=batch_size)
             return results
 
-def run_gpu_benchmark(dataset_name: str, batch_size: int = 32):
+def run_gpu_benchmark(dataset_name: str, batch_size: int = 32, max_epochs=100):
     """Run benchmark using GPU-optimized implementation"""
     print(f"\nRunning GPU benchmark on {dataset_name} dataset...")
 
     model = GPUDBNN(
         dataset_name=dataset_name,
         learning_rate=0.01,
-        max_epochs=100
+        max_epochs= max_epochs
     )
     history = model.adaptive_fit_predict(max_rounds=model.max_epochs, batch_size=batch_size)
     results = model.fit_predict(batch_size=batch_size)
