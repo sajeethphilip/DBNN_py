@@ -1150,8 +1150,14 @@ class GPUDBNN:
             # Add confidence-based pass/fail label
             n_classes = len(self.label_encoder.classes_)
             confidence_threshold = 1.0 / n_classes
+            # Get probability columns
+            prob_columns = [f'prob_{class_label}' for class_label in self.label_encoder.classes_]
+
+            # Check if true class probability is highest AND exceeds threshold
             result_df['confidence_check'] = np.where(
-                (true_probs >= confidence_threshold) & correct_prediction,
+                (true_probs >= confidence_threshold) &
+                (true_probs == result_df[prob_columns].max(axis=1)) &
+                correct_prediction,
                 'Passed',
                 'Failed'
             )
