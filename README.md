@@ -8,7 +8,7 @@ Add a # to the configure file features before the feature names to exclude any f
 
 By default, the Imposed conditional independence is assumed on pairs of features ("feature_group_size": 2) but can be edited in the conf file to any number equal/less than the total number of features.
 
-Press the "q" or "Q" key during training to interrupt training and go to the next stage.
+Press the "q" or "Q" key during training to interrupt training and go to the next stage. However, in Linux, this works only on machines where you have an X11 window.
 
 The older version of the C++ code used space as the separator, which is not ideal. space2csv.py function can convert the file into CSV.
 Let me break down the key components of this GPU-optimized Deep Bayesian Neural Network (DBNN) implementation.
