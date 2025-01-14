@@ -23,60 +23,6 @@ import torch
 import os
 import pickle
 
-# Assume no keyboard control by default. If you have X11 running and want to be interactive, set nokbd = False
-nokbd =  True #False #
-display = None  # Initialize display variable
-
-if nokbd==False:
-    print("Will attempt keyboard interaction...")
-    if os.name == 'nt' or 'darwin' in os.uname()[0].lower():  # Windows or MacOS
-        try:
-            from pynput import keyboard
-            nokbd = False
-        except:
-            print("Could not initialize keyboard control")
-    else:
-        # Check if X server is available on Linux
-        def is_x11_available():
-            if os.name != 'posix':  # Not Linux/Unix
-                return True
-
-            # Check if DISPLAY environment variable is set
-            if 'DISPLAY' not in os.environ:
-                return False
-
-            try:
-                import Xlib.display
-                global display
-                display = Xlib.display.Display()
-                return True
-            except:
-                return False
-
-        def cleanup_display():
-            global display
-            if display:
-                try:
-                    display.close()
-                    display = None
-                except:
-                    pass
-
-        # Only try to import pynput if X11 is available
-        if is_x11_available():
-            try:
-                from pynput import keyboard
-                nokbd = False
-            except:
-                print("Could not initialize keyboard control despite X11 being available")
-            finally:
-                cleanup_display()
-        else:
-            print("Keyboard control using q key for skipping training is not supported without X11!")
-else:
-    print('Keyboard is disabled by default. To enable it please set nokbd=False')
-
-
 #------------------------------------------------------------------------Declarations---------------------
 Trials = 100  # Number of epochs to wait for improvement in training
 cardinality_threshold =0.9
@@ -90,6 +36,9 @@ Train_only=False #True #
 Predict=True
 Gen_Samples=False
 EnableAdaptive = True  # New parameter to control adaptive training
+# Assume no keyboard control by default. If you have X11 running and want to be interactive, set nokbd = False
+nokbd =  False # Enables interactive keyboard when training (q and Q will not have any effect)
+display = None  # Initialize display variable
 #----------------------------------------------------------------------------------------------------------------
 
 class DatasetConfig:
@@ -325,11 +274,13 @@ class GPUDBNN:
         self.config = DatasetConfig.load_config(self.dataset_name)
 
         # Initialize other attributes
-        self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = Train_device
         self.learning_rate = learning_rate
         self.max_epochs = max_epochs
         self.test_size = test_size
         self.random_state = random_state
+        #self.compute_dtype = torch.float64  # Use double precision for computations
+        self.cardinality_tolerance = cardinality_tolerance  # Only for feature grouping
 
         # Handle fresh start after configuration is loaded
         if fresh:
@@ -345,7 +296,7 @@ class GPUDBNN:
         self.in_adaptive_fit=False # Set when we are in adaptive learning process
         #------------------------------------------Adaptive Learning--------------------------------------
         # Automatically select device if none specified
-        self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+
         print(f"Using device: {self.device}")
 
         self.dataset_name = dataset_name.lower()
@@ -476,7 +427,7 @@ class GPUDBNN:
             print(f"Training set size: {len(train_indices)}")
 
             # Split data
-            train_mask = torch.zeros(len(X), dtype=torch.bool)
+            train_mask = torch.zeros(len(X), dtype=torch.bool,device=self.device)
             train_mask[train_indices] = True
             test_mask = ~train_mask
             test_indices = torch.where(test_mask)[0].tolist()
@@ -593,36 +544,23 @@ class GPUDBNN:
 
 
     def _remove_high_cardinality_columns(self, df: pd.DataFrame, threshold: float = 0.8) -> pd.DataFrame:
-        df=df.round(cardinality_tolerance)
-        """
-        Remove columns with unique values exceeding the threshold percentage
+        # Only use cardinality_tolerance for feature grouping, not computations
+        df_grouped = df.round(cardinality_tolerance)  # For grouping only
+        df_filtered = df.copy()  # Keep original precision for computations
 
-        Args:
-            df: Input DataFrame
-            threshold: Maximum allowed percentage of unique values (default: 0.8 or 80%)
-
-        Returns:
-            DataFrame with high cardinality columns removed
-        """
-        df_filtered = df.copy()
         columns_to_drop = []
-
         for column in df.columns:
-            # Skip target column
             if column == self.target_column:
                 continue
-
-            # Calculate percentage of unique values
-            unique_ratio = len(df[column].unique()) / len(df)
-
+            # Use grouped data for cardinality check only
+            unique_ratio = len(df_grouped[column].unique()) / len(df)
             if unique_ratio > threshold:
                 columns_to_drop.append(column)
 
         if columns_to_drop:
             df_filtered = df_filtered.drop(columns=columns_to_drop)
-            print(f"Dropped {len(columns_to_drop)} high cardinality columns: {columns_to_drop}")
-
         return df_filtered
+
 
 
 
@@ -654,13 +592,7 @@ class GPUDBNN:
         return torch.tensor(all_combinations).to(self.device)
 #----------------------------------------------------------------------------------------------------------------------------------------------------------------------
     def _compute_pairwise_likelihood_parallel(self, dataset: torch.Tensor, labels: torch.Tensor, feature_dims: int):
-        """Compute likelihood parameters in parallel using feature groups with optimized vectorization
-
-        Args:
-            dataset: Input tensor of shape (n_samples, n_features)
-            labels: Tensor of shape (n_samples,) containing class labels
-            feature_dims: Total number of feature dimensions
-        """
+        """Compute likelihood parameters in parallel using feature groups with optimized vectorization"""
         # Move data to GPU if available
         dataset = dataset.to(self.device)
         labels = labels.to(self.device)
@@ -684,34 +616,44 @@ class GPUDBNN:
         means = torch.zeros((n_classes, n_combinations, group_size), device=self.device)
         covs = torch.zeros((n_classes, n_combinations, group_size, group_size), device=self.device)
 
-        # Create feature pair index tensor for efficient indexing
-        feature_pairs_tensor = torch.LongTensor(self.feature_pairs).to(self.device)
+        # Convert feature_pairs to tensor once and move to correct device
+        feature_pairs_tensor = self.feature_pairs.clone().detach().to(device=self.device)
+
+
+        # Pre-compute eye matrix for stability
+        stability_term = torch.eye(group_size, device=self.device).unsqueeze(0).unsqueeze(0) * 1e-6
 
         for class_idx, class_id in enumerate(unique_classes):
             class_mask = (labels == class_id)
             class_data = dataset[class_mask]
+            n_samples = len(class_data)
 
-            # Extract all feature groups maintaining original stacking behavior
-            group_data = torch.stack([
-                class_data[:, pair] for pair in self.feature_pairs
-            ], dim=1)  # Shape: (n_samples, n_combinations, group_size)
+            # Vectorized feature extraction - reshape for batch processing
+            # Shape: (n_samples, n_combinations, group_size)
+            group_data = class_data[:, feature_pairs_tensor.view(-1)].view(
+                n_samples, n_combinations, group_size
+            )
 
             # Compute means for all groups simultaneously
             means[class_idx] = torch.mean(group_data, dim=0)
 
-            # Center the data
+            # Center the data once for all groups
             centered_data = group_data - means[class_idx].unsqueeze(0)
 
-            # Compute covariances for all groups in parallel
-            # Original logic maintained but vectorized
-            for i in range(n_combinations):
-                covs[class_idx, i] = torch.mm(
-                    centered_data[:, i].T,
-                    centered_data[:, i]
-                ) / (len(class_data) - 1)
+            # Vectorized covariance computation for all groups at once
+            # Reshape for batch matrix multiplication
+            # (n_samples, n_combinations, group_size) -> (n_combinations, n_samples, group_size)
+            centered_data_t = centered_data.transpose(0, 1)
+
+            # Compute all covariances in one operation
+            # Shape: (n_combinations, group_size, group_size)
+            covs[class_idx] = torch.matmul(
+                centered_data_t.transpose(-2, -1),  # (n_combinations, group_size, n_samples)
+                centered_data_t  # (n_combinations, n_samples, group_size)
+            ) / (n_samples - 1)
 
         # Add small diagonal term for numerical stability
-        covs += torch.eye(group_size, device=self.device).unsqueeze(0).unsqueeze(0) * 1e-6
+        covs += stability_term
 
         return {
             'means': means,
@@ -799,7 +741,7 @@ class GPUDBNN:
     def _update_priors_parallel(self, failed_cases: List[Tuple], batch_size: int = 32):
         """
         Update priors in parallel for failed cases using vectorized operations
-        and optimized matrix multiplication
+        and optimized matrix multiplication with consistent device handling
 
         Args:
             failed_cases: List of (feature, true_class) tuples
@@ -811,29 +753,37 @@ class GPUDBNN:
 
         # Process all cases at once instead of batching
         features = torch.stack([case[0] for case in failed_cases]).to(self.device)
-        true_classes = torch.tensor([case[1] for case in failed_cases]).to(self.device)
+        # Ensure true_classes is on the correct device from the start
+        true_classes = torch.tensor([case[1] for case in failed_cases], device=self.device)
 
         # Compute posteriors for all cases at once
         posteriors = self._compute_batch_posterior(features)  # Shape: [n_failed, n_classes]
 
         n_classes = len(self.likelihood_params['classes'])
 
-        # Create mask for non-true classes efficiently (equivalent to 1 - eye_matrix)
+        # Create class range tensor directly on the correct device
         class_range = torch.arange(n_classes, device=self.device)
+        # Ensure true_classes is on the same device when creating mask
+        true_classes = true_classes.to(self.device)  # Extra safety check
         mask = (class_range.unsqueeze(0) != true_classes.unsqueeze(1))  # Shape: [n_failed, n_classes]
 
-        # Get probabilities for true classes and max of other classes efficiently
-        true_probs = posteriors[torch.arange(n_failed, device=self.device), true_classes]  # Shape: [n_failed]
+        # Create range tensor directly on the correct device
+        batch_range = torch.arange(n_failed, device=self.device)
+        true_probs = posteriors[batch_range, true_classes]  # Shape: [n_failed]
         max_other_probs = (posteriors * mask).max(dim=1)[0]  # Shape: [n_failed]
 
         # Compute adjustments vectorized with bounds
         raw_adjustments = self.learning_rate * (1 - true_probs/max_other_probs)  # Shape: [n_failed]
         adjustments = torch.clamp(raw_adjustments, -0.5, 0.5)
 
-        # Update weights for all classes simultaneously
+        # Create zeros tensor directly on the correct device
         class_adjustments = torch.zeros(n_classes, device=self.device)
         for class_idx in range(n_classes):
-            class_mask = (true_classes == self.likelihood_params['classes'][class_idx])
+            # Ensure class_id is a tensor on the correct device if needed
+            class_id = self.likelihood_params['classes'][class_idx]
+            if isinstance(class_id, torch.Tensor):
+                class_id = class_id.to(self.device)
+            class_mask = (true_classes == class_id)
             if class_mask.any():
                 class_adjustments[class_idx] = adjustments[class_mask].mean()
 
@@ -861,6 +811,7 @@ class GPUDBNN:
                 posteriors = self._compute_batch_posterior(batch_X)
                 batch_predictions = torch.argmax(posteriors, dim=1)
                 predictions.append(batch_predictions)
+
         finally:
             # Restore current weights
             self.current_W = temp_W
@@ -929,6 +880,36 @@ class GPUDBNN:
                 print(f"Warning: Could not load weights from {weights_file}: {str(e)}")
                 self.best_W = None
 
+    def _init_keyboard_listener(self):
+        """Initialize keyboard listener with shared display connection"""
+        if not hasattr(self, '_display'):
+            try:
+                import Xlib.display
+                self._display = Xlib.display.Display()
+            except Exception as e:
+                print(f"Warning: Could not initialize X display: {e}")
+                return None
+
+        try:
+            from pynput import keyboard
+            return keyboard.Listener(
+                on_press=self._on_key_press,
+                _display=self._display  # Pass shared display connection
+            )
+        except Exception as e:
+            print(f"Warning: Could not create keyboard listener: {e}")
+            return None
+
+    def _cleanup_keyboard(self):
+        """Clean up keyboard resources"""
+        if hasattr(self, '_display'):
+            try:
+                self._display.close()
+                del self._display
+            except:
+                pass
+
+
     def train(self, X_train: torch.Tensor, y_train: torch.Tensor, X_test: torch.Tensor, y_test: torch.Tensor,batch_size: int = 32):
         # Load previous best error if exists
         previous_best_error = float('inf')
@@ -936,6 +917,7 @@ class GPUDBNN:
             previous_best_error = self.best_error
         """Train the model using batch processing"""
         # Move data to device
+
         X_train = X_train.to(self.device)
         y_train = y_train.to(self.device)
         X_test = X_test.to(self.device)
@@ -955,13 +937,14 @@ class GPUDBNN:
             except AttributeError:
                 pass
         if not nokbd:
-            listener = keyboard.Listener(on_press=on_press)
-            listener.start()
+            self.keyboard_listener = self._init_keyboard_listener()
+            if self.keyboard_listener:
+                self.keyboard_listener.start()
         # Compute likelihood parameters
+
         self.likelihood_params = self._compute_pairwise_likelihood_parallel(
             X_train, y_train, X_train.shape[1]
         )
-
         # Initialize weights if not loaded
         if self.current_W is None:
             n_pairs = len(self.feature_pairs)
@@ -991,17 +974,18 @@ class GPUDBNN:
                 batch_end = min(i + batch_size, n_samples)
                 batch_X = X_train[i:batch_end]
                 batch_y = y_train[i:batch_end]
+                batch_y = batch_y.to(self.device)  # Ensure batch_y is on correct device
 
                 # Compute posteriors for batch
                 posteriors = self._compute_batch_posterior(batch_X)
-                predictions = torch.argmax(posteriors, dim=1)
+                predictions = torch.argmax(posteriors, dim=1).to(self.device)
 
-                # Track failures
+                # Track failures - now both tensors are on same device
                 failures = (predictions != batch_y)
                 n_errors += failures.sum().item()
 
                 if failures.any():
-                    failed_indices = torch.where(failures)[0]
+                    failed_indices = torch.where(failures)[0].to(self.device)
                     for idx in failed_indices:
                         failed_cases.append((
                             batch_X[idx],
@@ -1040,7 +1024,10 @@ class GPUDBNN:
                 break
             if stop_training:
                 if not nokbd:
-                    listener.stop()
+                    # Clean up keyboard resources
+                    if hasattr(self, 'keyboard_listener'):
+                        self.keyboard_listener.stop()
+                    self._cleanup_keyboard()
                 print("\nTraining interrupted by user")
                 break
 
@@ -1076,6 +1063,10 @@ class GPUDBNN:
                 save_path=f'{self.dataset_name}_training_metrics.png'
             )
         self._save_model_components()
+        # Clean up keyboard resources
+        if hasattr(self, 'keyboard_listener'):
+            self.keyboard_listener.stop()
+        self._cleanup_keyboard()
         return self.current_W.cpu(), error_rates
 
     def plot_training_metrics(self, train_loss, test_loss, train_acc, test_acc, save_path=None):
@@ -1502,6 +1493,7 @@ class GPUDBNN:
             batch_size: Batch size for training and prediction
             save_path: Path to save predictions CSV file. If None, predictions won't be saved
         """
+
         # Prepare data
         X = self.data.drop(columns=[self.target_column])
         y = self.data[self.target_column]
@@ -1523,11 +1515,11 @@ class GPUDBNN:
             stratify=y_tensor.cpu().numpy()
         )
 
-        # Convert split data back to tensors
-        X_train = torch.FloatTensor(X_train).to(self.device)
-        X_test = torch.FloatTensor(X_test).to(self.device)
-        y_train = torch.LongTensor(y_train).to(self.device)
-        y_test = torch.LongTensor(y_test).to(self.device)
+        # Convert split data back to tensors - CORRECTED VERSION
+        X_train = torch.from_numpy(X_train).to(self.device, dtype=torch.float32)
+        X_test = torch.from_numpy(X_test).to(self.device, dtype=torch.float32)
+        y_train = torch.from_numpy(y_train).to(self.device, dtype=torch.long)
+        y_test = torch.from_numpy(y_test).to(self.device, dtype=torch.long)
 
         # Train model
         final_W, error_rates = self.train(X_train, y_train,X_test, y_test, batch_size=batch_size)
@@ -1804,6 +1796,14 @@ def run_benchmark(dataset_name: str):
 
     return model, results
 
+def train_test_split_tensor(X, y, test_size, random_state):
+    num_samples = len(X)
+    indices = torch.randperm(num_samples, device=X.device)
+    split = int(num_samples * (1 - test_size))
+    train_idx = indices[:split]
+    test_idx = indices[split:]
+    return X[train_idx], X[test_idx], y[train_idx], y[test_idx]
+
 def plot_training_progress(error_rates: List[float], dataset_name: str):
     """Plot training error rates over epochs"""
     plt.figure(figsize=(10, 6))
@@ -1888,7 +1888,7 @@ def load_global_config():
         # Define globals
         global Trials, cardinality_threshold, cardinality_tolerance
         global LearningRate, TrainingRandomSeed, Epochs, TestFraction
-        global Train, Train_only, Predict, Gen_Samples, EnableAdaptive
+        global Train, Train_only, Predict, Gen_Samples, EnableAdaptive,nokbd,Train_device
 
         # Load training parameters
         Trials = config['training_params']['trials']
@@ -1899,6 +1899,8 @@ def load_global_config():
         Epochs = config['training_params']['epochs']
         TestFraction = config['training_params']['test_fraction']
         EnableAdaptive = config['training_params']['enable_adaptive']
+        usekbd =config['training_params']['use_interactive_kbd']
+        Train_device=config['training_params']['compute_device']
 
         # Load execution flags
         Train = config['execution_flags']['train']
@@ -1907,7 +1909,14 @@ def load_global_config():
         Gen_Samples = config['execution_flags']['gen_samples']
         Fresh = config['execution_flags']['fresh_start']
 
+        nokbd= not usekbd
+        if Train_device=='auto':
+            Train_device='cuda' if torch.cuda.is_available() else 'cpu'
         print("Global configuration loaded successfully")
+        print(f"System is set to work on {Train_device}")
+        if nokbd:
+            print("Interactive keys disabled")
+
         return Fresh
 
     except Exception as e:
@@ -1922,6 +1931,8 @@ def load_global_config():
         Predict = True
         Gen_Samples = False
         EnableAdaptive = True  # Default value
+        nokbd = False
+        Train_device='cuda' if torch.cuda.is_available() else 'cpu'
         print("Using default values")
         return False
 
@@ -1931,6 +1942,55 @@ def load_global_config():
 if __name__ == "__main__":
     # Load configuration before class definition
     fresh_start = load_global_config()
+    if nokbd==False:
+        print("Will attempt keyboard interaction...")
+        if os.name == 'nt' or 'darwin' in os.uname()[0].lower():  # Windows or MacOS
+            try:
+                from pynput import keyboard
+                nokbd = False
+            except:
+                print("Could not initialize keyboard control")
+        else:
+            # Check if X server is available on Linux
+            def is_x11_available():
+                if os.name != 'posix':  # Not Linux/Unix
+                    return True
+
+                # Check if DISPLAY environment variable is set
+                if 'DISPLAY' not in os.environ:
+                    return False
+
+                try:
+                    import Xlib.display
+                    global display
+                    display = Xlib.display.Display()
+                    return True
+                except:
+                    return False
+
+            def cleanup_display():
+                global display
+                if display:
+                    try:
+                        display.close()
+                        display = None
+                    except:
+                        pass
+
+            # Only try to import pynput if X11 is available
+            if is_x11_available():
+                try:
+                    from pynput import keyboard
+                    nokbd = False
+                except:
+                    print("Could not initialize keyboard control despite X11 being available")
+                finally:
+                    cleanup_display()
+            else:
+                print("Keyboard control using q key for skipping training is not supported without X11!")
+    else:
+        print('Keyboard is disabled . You can enable it in config')
+
 
     if Gen_Samples:
         generate_test_datasets()
