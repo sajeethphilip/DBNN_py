@@ -24,7 +24,7 @@ import os
 import pickle
 
 # Assume no keyboard control by default. If you have X11 running and want to be interactive, set nokbd = False
-nokbd = False # True #
+nokbd =  True #False #
 display = None  # Initialize display variable
 
 if nokbd==False:
@@ -89,6 +89,7 @@ Train=True #True #False #
 Train_only=False #True #
 Predict=True
 Gen_Samples=False
+EnableAdaptive = True  # New parameter to control adaptive training
 #----------------------------------------------------------------------------------------------------------------
 
 class DatasetConfig:
@@ -426,6 +427,10 @@ class GPUDBNN:
         """
         Adaptive training strategy using saved predictions from fit_predict
         """
+        if not EnableAdaptive:
+            print("Adaptive learning is disabled. Using standard training.")
+            return self.fit_predict(batch_size=batch_size)
+
         self.in_adaptive_fit=True
         # Get initial data (using class members)
         X = self.data.drop(columns=[self.target_column])
@@ -649,7 +654,13 @@ class GPUDBNN:
         return torch.tensor(all_combinations).to(self.device)
 #----------------------------------------------------------------------------------------------------------------------------------------------------------------------
     def _compute_pairwise_likelihood_parallel(self, dataset: torch.Tensor, labels: torch.Tensor, feature_dims: int):
-        """Compute likelihood parameters in parallel using feature groups"""
+        """Compute likelihood parameters in parallel using feature groups with optimized vectorization
+
+        Args:
+            dataset: Input tensor of shape (n_samples, n_features)
+            labels: Tensor of shape (n_samples,) containing class labels
+            feature_dims: Total number of feature dimensions
+        """
         # Move data to GPU if available
         dataset = dataset.to(self.device)
         labels = labels.to(self.device)
@@ -666,8 +677,6 @@ class GPUDBNN:
         )
 
         unique_classes = torch.unique(labels)
-
-        # Initialize storage for likelihood parameters
         n_combinations = len(self.feature_pairs)
         n_classes = len(unique_classes)
 
@@ -675,32 +684,34 @@ class GPUDBNN:
         means = torch.zeros((n_classes, n_combinations, group_size), device=self.device)
         covs = torch.zeros((n_classes, n_combinations, group_size, group_size), device=self.device)
 
+        # Create feature pair index tensor for efficient indexing
+        feature_pairs_tensor = torch.LongTensor(self.feature_pairs).to(self.device)
+
         for class_idx, class_id in enumerate(unique_classes):
             class_mask = (labels == class_id)
             class_data = dataset[class_mask]
 
-            # Extract all feature groups in parallel
-            # Reshape to handle arbitrary group sizes
+            # Extract all feature groups maintaining original stacking behavior
             group_data = torch.stack([
-                class_data[:, self.feature_pairs[i]] for i in range(n_combinations)
-            ], dim=1)
+                class_data[:, pair] for pair in self.feature_pairs
+            ], dim=1)  # Shape: (n_samples, n_combinations, group_size)
 
             # Compute means for all groups simultaneously
             means[class_idx] = torch.mean(group_data, dim=0)
 
-            # Compute covariances for all groups in parallel
+            # Center the data
             centered_data = group_data - means[class_idx].unsqueeze(0)
 
-            # Update batch covariance computation for arbitrary group sizes
+            # Compute covariances for all groups in parallel
+            # Original logic maintained but vectorized
             for i in range(n_combinations):
-                batch_cov = torch.mm(
+                covs[class_idx, i] = torch.mm(
                     centered_data[:, i].T,
                     centered_data[:, i]
                 ) / (len(class_data) - 1)
-                covs[class_idx, i] = batch_cov
 
-            # Add small diagonal term for numerical stability
-            covs[class_idx] += torch.eye(group_size, device=self.device) * 1e-6
+        # Add small diagonal term for numerical stability
+        covs += torch.eye(group_size, device=self.device).unsqueeze(0).unsqueeze(0) * 1e-6
 
         return {
             'means': means,
@@ -708,7 +719,7 @@ class GPUDBNN:
             'classes': unique_classes
         }
 
-    def  _compute_batch_posterior(self, features: torch.Tensor, epsilon: float = 1e-10):
+    def _compute_batch_posterior(self, features: torch.Tensor, epsilon: float = 1e-10):
         """
         Compute posterior probabilities for a batch of samples using feature groups.
         Optimized version using parallel computation and vectorized operations.
@@ -785,7 +796,7 @@ class GPUDBNN:
 
         return posteriors
 
-    def  _update_priors_parallel(self, failed_cases: List[Tuple], batch_size: int = 32):
+    def _update_priors_parallel(self, failed_cases: List[Tuple], batch_size: int = 32):
         """
         Update priors in parallel for failed cases using vectorized operations
         and optimized matrix multiplication
@@ -807,14 +818,13 @@ class GPUDBNN:
 
         n_classes = len(self.likelihood_params['classes'])
 
-        # Create mask for non-true classes efficiently
+        # Create mask for non-true classes efficiently (equivalent to 1 - eye_matrix)
         class_range = torch.arange(n_classes, device=self.device)
-        mask = ~(class_range.unsqueeze(0) == true_classes.unsqueeze(1))  # Shape: [n_failed, n_classes]
+        mask = (class_range.unsqueeze(0) != true_classes.unsqueeze(1))  # Shape: [n_failed, n_classes]
 
         # Get probabilities for true classes and max of other classes efficiently
         true_probs = posteriors[torch.arange(n_failed, device=self.device), true_classes]  # Shape: [n_failed]
-        masked_posteriors = posteriors.masked_fill(~mask, float('-inf'))
-        max_other_probs = masked_posteriors.max(dim=1)[0]  # Shape: [n_failed]
+        max_other_probs = (posteriors * mask).max(dim=1)[0]  # Shape: [n_failed]
 
         # Compute adjustments vectorized with bounds
         raw_adjustments = self.learning_rate * (1 - true_probs/max_other_probs)  # Shape: [n_failed]
@@ -1878,7 +1888,7 @@ def load_global_config():
         # Define globals
         global Trials, cardinality_threshold, cardinality_tolerance
         global LearningRate, TrainingRandomSeed, Epochs, TestFraction
-        global Train, Train_only, Predict, Gen_Samples
+        global Train, Train_only, Predict, Gen_Samples, EnableAdaptive
 
         # Load training parameters
         Trials = config['training_params']['trials']
@@ -1888,6 +1898,7 @@ def load_global_config():
         TrainingRandomSeed = config['training_params']['random_seed']
         Epochs = config['training_params']['epochs']
         TestFraction = config['training_params']['test_fraction']
+        EnableAdaptive = config['training_params']['enable_adaptive']
 
         # Load execution flags
         Train = config['execution_flags']['train']
@@ -1898,6 +1909,7 @@ def load_global_config():
 
         print("Global configuration loaded successfully")
         return Fresh
+
     except Exception as e:
         print(f"Error loading configuration: {str(e)}")
         # Set default values
@@ -1909,8 +1921,10 @@ def load_global_config():
         Train_only = False
         Predict = True
         Gen_Samples = False
+        EnableAdaptive = True  # Default value
         print("Using default values")
         return False
+
 
 
 
