@@ -1,0 +1,79 @@
+\documentclass[12pt]{article}
+\usepackage{amsmath, amssymb, graphicx, algorithm2e}
+\title{Deep Bayesian Neural Network: Mathematical Framework}
+\author{Technical Documentation}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{Core Probability Functions}
+
+\subsection{Multivariate Normal PDF}
+The foundation of the likelihood computation is the multivariate normal probability density function:
+\[
+p(x|\mu,\Sigma) = \frac{1}{(2\pi)^{d/2}|\Sigma|^{1/2}} \exp\left(-\frac{1}{2}(x-\mu)^T\Sigma^{-1}(x-\mu)\right)
+\]
+
+\subsection{Posterior Probability}
+For class $c$, the posterior probability is computed as:
+\[
+P(c|x) = \frac{P(x|c)P(c)}{\sum_{k} P(x|k)P(k)}
+\]
+
+\section{Feature Processing}
+
+\subsection{Covariance Matrix}
+For each feature group:
+\[
+\Sigma = \frac{1}{n-1}\sum_{i=1}^n (x_i - \mu)(x_i - \mu)^T + \lambda I
+\]
+where $\lambda = 10^{-6}$ is the stability term.
+
+\subsection{Feature Standardization}
+\[
+x_{normalized} = \frac{x - \mu}{\sigma + \epsilon}
+\]
+where $\epsilon = 10^{-8}$ for numerical stability.
+
+\section{Adaptive Learning Process}
+
+\subsection{Weight Update Mechanism}
+For each failed case:
+\[
+w_{new} = w_{old}(1 + \alpha(1 - \frac{P_{true}}{P_{max\_other}}))
+\]
+where:
+\begin{itemize}
+\item $\alpha$ is the learning rate
+\item $P_{true}$ is the posterior probability of true class
+\item $P_{max\_other}$ is the maximum posterior among other classes
+\end{itemize}
+
+\subsection{Sample Selection}
+For each class $c$, select:
+\[
+\begin{cases}
+\arg\max_{x \in \text{Failed}_c} P(c|x) & \text{highest probability failure} \\
+\arg\min_{x \in \text{Failed}_c} P(c|x) & \text{lowest probability failure}
+\end{cases}
+\]
+
+\section{Error Rate Computation}
+The classification error rate is computed as:
+\[
+E = \frac{1}{N}\sum_{i=1}^N I(y_i \neq \hat{y_i})
+\]
+where $I$ is the indicator function.
+
+\section{Processing Flow}
+The algorithm follows this sequence:
+\begin{enumerate}
+\item Feature pair generation: $C(n,2)$ combinations
+\item Likelihood computation for each feature pair
+\item Posterior probability calculation
+\item Weight updates for misclassified samples
+\item Error rate computation and convergence check
+\end{enumerate}
+
+\end{document}
