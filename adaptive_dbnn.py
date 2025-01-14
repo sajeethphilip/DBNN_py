@@ -391,12 +391,21 @@ class GPUDBNN:
         y_encoded = self.label_encoder.fit_transform(y)
         unique_classes = np.unique(y_encoded)
         original_classes = self.label_encoder.inverse_transform(unique_classes)
-
-        # Initialize or load training indices
-        if load_epoch is not None:
-            train_indices, _ = self.load_epoch_data(load_epoch)
+        # Try to load last training epoch first
+        last_epoch_file = os.path.join(self.base_save_path, f'{self.dataset_name}_last_epoch.txt')
+        if os.path.exists(last_epoch_file):
+            with open(last_epoch_file, 'r') as f:
+                last_epoch = int(f.read().strip())
+            train_indices, test_indices = self.load_epoch_data(last_epoch)
+            start_round = last_epoch + 1
+            max_rounds=max_rounds+start_round
+            print(f"Continuing from epoch {last_epoch}")
+        # Then try specified epoch
+        elif load_epoch is not None:
+            train_indices, test_indices = self.load_epoch_data(load_epoch)
             start_round = load_epoch + 1
             print(f"Loading data from epoch {load_epoch}")
+        # Otherwise start fresh
         else:
             # Initialize with one example per class
             train_indices = []
@@ -457,6 +466,10 @@ class GPUDBNN:
             # Find misclassified examples
             misclassified_mask = (predictions != true_labels)
             misclassified_indices = np.where(misclassified_mask)[0]
+
+            # Save the last epoch number
+            with open(last_epoch_file, 'w') as f:
+                f.write(str(round_num))
 
             # Update history
             history['round'].append(round_num + 1)
@@ -530,7 +543,8 @@ class GPUDBNN:
         # Save final history
         with open(os.path.join(self.base_save_path, 'training_history.json'), 'w') as f:
             json.dump(history, f)
-
+        # Save final training/testing split
+        self.save_last_split(train_indices, test_indices)
         self.in_adaptive_fit=False
         return history
 
@@ -790,7 +804,49 @@ class GPUDBNN:
         # Apply updates to all weights simultaneously
         self.current_W *= (1 + class_adjustments.unsqueeze(1))  # Broadcasting across features
         self.current_W.clamp_(1e-10, 10.0)
+#---------------------------------------------------------Save Last data -------------------------
+    def save_last_split(self, train_indices: list, test_indices: list):
+        """Save the last training/testing split to CSV files"""
+        dataset_name = self.dataset_name
 
+        # Get full dataset
+        X = self.data.drop(columns=[self.target_column])
+        y = self.data[self.target_column]
+
+        # Save training data
+        train_data = pd.concat([X.iloc[train_indices], y.iloc[train_indices]], axis=1)
+        train_data.to_csv(f'{dataset_name}_Last_training.csv', index=False)
+
+        # Save testing data
+        test_data = pd.concat([X.iloc[test_indices], y.iloc[test_indices]], axis=1)
+        test_data.to_csv(f'{dataset_name}_Last_testing.csv', index=False)
+        print(f"Last testing data is saved to {dataset_name}_Last_testing.csv")
+        print(f"Last training data is saved to {dataset_name}_Last_training.csv")
+    def load_last_known_split(self):
+        """Load the last known good training/testing split"""
+        dataset_name = self.dataset_name
+        train_file = f'{dataset_name}_Last_training.csv'
+        test_file = f'{dataset_name}_Last_testing.csv'
+
+        if os.path.exists(train_file) and os.path.exists(test_file):
+            # Load the saved splits
+            train_data = pd.read_csv(train_file)
+            test_data = pd.read_csv(test_file)
+
+            # Get indices by matching with full dataset
+            X = self.data.drop(columns=[self.target_column])
+            train_indices = []
+            test_indices = []
+
+            # Match rows to find indices
+            for idx, row in X.iterrows():
+                if any((train_data.drop(columns=[self.target_column]) == row).all(axis=1)):
+                    train_indices.append(idx)
+                else:
+                    test_indices.append(idx)
+
+            return train_indices, test_indices
+        return None, None
 
 #---------------------------------------------------------------------------------------------------------
 
@@ -962,7 +1018,7 @@ class GPUDBNN:
         n_samples = len(X_train)
         error_rates = []
         if self.in_adaptive_fit:
-             patience = 3
+             patience = 5
         else:
             patience = Trials  # Number of epochs to wait for improvement
         for epoch in range(self.max_epochs):
@@ -1505,7 +1561,29 @@ class GPUDBNN:
         # Convert to tensors and move to device
         X_tensor = torch.FloatTensor(X_processed).to(self.device)
         y_tensor = torch.LongTensor(y_encoded).to(self.device)
+        if not self.in_adaptive_fit:
+            # Try to load last known split
+            train_indices, test_indices = self.load_last_known_split()
 
+            if train_indices is not None:
+                # Use saved split
+                X_train = X_tensor[train_indices]
+                X_test = X_tensor[test_indices]
+                y_train = y_tensor[train_indices]
+                y_test = y_tensor[test_indices]
+            else:
+                # Fall back to random split
+                X_train, X_test, y_train, y_test = train_test_split(
+                    X_tensor.cpu().numpy(),
+                    y_tensor.cpu().numpy(),
+                    test_size=self.test_size,
+                    random_state=self.random_state,
+                    stratify=y_tensor.cpu().numpy()
+                )
+                X_train = torch.FloatTensor(X_train).to(self.device)
+                X_test = torch.FloatTensor(X_test).to(self.device)
+                y_train = torch.LongTensor(y_train).to(self.device)
+                y_test = torch.LongTensor(y_test).to(self.device)
         # Split data
         X_train, X_test, y_train, y_test = train_test_split(
             X_tensor.cpu().numpy(),
@@ -1749,15 +1827,10 @@ class GPUDBNN:
             results = self.fit_predict(batch_size=batch_size)
             return results
 
-def run_gpu_benchmark(dataset_name: str, batch_size: int = 32, max_epochs=100):
+def run_gpu_benchmark(dataset_name: str, model=None, batch_size: int = 32):
     """Run benchmark using GPU-optimized implementation"""
     print(f"\nRunning GPU benchmark on {dataset_name} dataset...")
 
-    model = GPUDBNN(
-        dataset_name=dataset_name,
-        learning_rate=0.01,
-        max_epochs= max_epochs
-    )
     history = model.adaptive_fit_predict(max_rounds=model.max_epochs, batch_size=batch_size)
     results = model.fit_predict(batch_size=batch_size)
 
@@ -2009,7 +2082,7 @@ if __name__ == "__main__":
             )
 
             if Train:
-                model, results = run_gpu_benchmark(dataset)
+                model, results = run_gpu_benchmark(dataset,model)
 
             if Train_only:
                 results = model.fit_predict(
