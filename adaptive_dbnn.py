@@ -708,58 +708,75 @@ class GPUDBNN:
             'classes': unique_classes
         }
 
-    def _compute_batch_posterior(self, features: torch.Tensor, epsilon: float = 1e-10):
-        """Compute posterior probabilities for a batch of samples using feature groups"""
+    def  _compute_batch_posterior(self, features: torch.Tensor, epsilon: float = 1e-10):
+        """
+        Compute posterior probabilities for a batch of samples using feature groups.
+        Optimized version using parallel computation and vectorized operations.
+        """
         batch_size = features.shape[0]
         n_classes = len(self.likelihood_params['classes'])
-
-        # Get group size from feature pairs shape
         group_size = self.feature_pairs.shape[1]
 
-        # Extract groups for the batch
+        # Extract groups for the batch - shape: [batch_size, n_combinations, group_size]
         batch_groups = torch.stack([
             features[:, self.feature_pairs[i]] for i in range(len(self.feature_pairs))
-        ], dim=1)  # Shape: [batch_size, n_combinations, group_size]
+        ], dim=1)
+
+        # Reshape means to [n_classes, n_combinations, group_size]
+        means = torch.stack([self.likelihood_params['means'][c] for c in range(n_classes)])
+
+        # Reshape covs to [n_classes, n_combinations, group_size, group_size]
+        covs = torch.stack([self.likelihood_params['covs'][c] for c in range(n_classes)])
+
+        # Compute inverse covariance matrices for all classes at once
+        inv_covs = torch.inverse(covs)
+
+        # Compute log determinants for all classes at once - shape: [n_classes, n_combinations]
+        log_dets = torch.logdet(covs)
 
         # Initialize log likelihoods
         log_likelihoods = torch.zeros((batch_size, n_classes), device=self.device)
 
-        for class_idx in range(n_classes):
-            # Get parameters for current class
-            class_means = self.likelihood_params['means'][class_idx]
-            class_covs = self.likelihood_params['covs'][class_idx]
-            class_priors = self.current_W[class_idx]
+        # Expand batch_groups to [batch_size, n_classes, n_combinations, group_size]
+        expanded_groups = batch_groups.unsqueeze(1).expand(-1, n_classes, -1, -1)
 
-            # Compute mahalanobis distance for all groups in parallel
-            centered = batch_groups - class_means.unsqueeze(0)
+        # Expand means to match batch_groups shape
+        expanded_means = means.unsqueeze(0).expand(batch_size, -1, -1, -1)
 
-            # Compute inverse of covariance matrices
-            inv_covs = torch.inverse(class_covs)
+        # Compute centered data for all classes at once
+        centered = expanded_groups - expanded_means
 
-            # Compute quadratic form for all samples and groups
-            quad_form = torch.zeros((batch_size, len(self.feature_pairs)), device=self.device)
+        # Reshape centered for batch matrix multiplication
+        # [batch_size, n_classes, n_combinations, 1, group_size]
+        centered_reshaped = centered.unsqueeze(-2)
 
-            for i in range(len(self.feature_pairs)):
-                quad_form[:, i] = torch.sum(
-                    torch.matmul(centered[:, i, :], inv_covs[i]) * centered[:, i, :],
-                    dim=1
-                )
+        # Expand inv_covs to match batch size
+        # [batch_size, n_classes, n_combinations, group_size, group_size]
+        expanded_inv_covs = inv_covs.unsqueeze(0).expand(batch_size, -1, -1, -1, -1)
 
-            # Compute log determinant
-            log_det = torch.logdet(class_covs)
+        # Compute quadratic form for all samples, classes, and groups at once
+        # Shape: [batch_size, n_classes, n_combinations]
+        quad_form = torch.matmul(
+            torch.matmul(centered_reshaped, expanded_inv_covs),
+            centered.unsqueeze(-1)
+        ).squeeze(-1).squeeze(-1)
 
-            # Compute log likelihood for all groups
-            pair_log_likelihood = -0.5 * (
-                group_size * np.log(2 * np.pi) +
-                log_det.unsqueeze(0) +
-                quad_form
-            )
+        # Compute log likelihood for all groups
+        # Shape: [batch_size, n_classes, n_combinations]
+        pair_log_likelihood = -0.5 * (
+            group_size * np.log(2 * np.pi) +
+            log_dets.unsqueeze(0) +
+            quad_form
+        )
 
-            # Add prior weights
-            weighted_likelihood = pair_log_likelihood + torch.log(class_priors + epsilon)
+        # Add prior weights (expanded to match shape)
+        # Shape: [batch_size, n_classes, n_combinations]
+        expanded_priors = self.current_W.unsqueeze(0).expand(batch_size, -1, -1)
+        weighted_likelihood = pair_log_likelihood + torch.log(expanded_priors + epsilon)
 
-            # Sum over groups for each sample
-            log_likelihoods[:, class_idx] = weighted_likelihood.sum(dim=1)
+        # Sum over groups for each sample and class
+        # Shape: [batch_size, n_classes]
+        log_likelihoods = weighted_likelihood.sum(dim=2)
 
         # Compute posteriors using log-sum-exp trick
         max_log_likelihood = torch.max(log_likelihoods, dim=1, keepdim=True)[0]
@@ -768,47 +785,51 @@ class GPUDBNN:
 
         return posteriors
 
-    def _update_priors_parallel(self, failed_cases: List[Tuple], batch_size: int = 32):
-            """Update priors in parallel for failed cases"""
-            n_failed = len(failed_cases)
-            n_batches = (n_failed + batch_size - 1) // batch_size
+    def  _update_priors_parallel(self, failed_cases: List[Tuple], batch_size: int = 32):
+        """
+        Update priors in parallel for failed cases using vectorized operations
+        and optimized matrix multiplication
 
-            for i in range(n_batches):
-                start_idx = i * batch_size
-                end_idx = min((i + 1) * batch_size, n_failed)
-                batch_cases = failed_cases[start_idx:end_idx]
+        Args:
+            failed_cases: List of (feature, true_class) tuples
+            batch_size: Size of batches for parallel processing
+        """
+        n_failed = len(failed_cases)
+        if n_failed == 0:
+            return
 
-                # Prepare batch data
-                features = torch.stack([case[0] for case in batch_cases]).to(self.device)
-                true_classes = torch.tensor([case[1] for case in batch_cases]).to(self.device)
+        # Process all cases at once instead of batching
+        features = torch.stack([case[0] for case in failed_cases]).to(self.device)
+        true_classes = torch.tensor([case[1] for case in failed_cases]).to(self.device)
 
-                # Compute posteriors for batch
-                posteriors = self._compute_batch_posterior(features)
+        # Compute posteriors for all cases at once
+        posteriors = self._compute_batch_posterior(features)  # Shape: [n_failed, n_classes]
 
-                # Create identity matrix on the same device
-                n_classes = len(self.likelihood_params['classes'])
-                eye_matrix = torch.eye(n_classes, device=self.device)
+        n_classes = len(self.likelihood_params['classes'])
 
-                # Compute adjustments in parallel
-                true_probs = posteriors[torch.arange(len(batch_cases), device=self.device), true_classes]
-                max_other_probs = torch.max(
-                    posteriors * (1 - eye_matrix)[true_classes],
-                    dim=1
-                )[0]
+        # Create mask for non-true classes efficiently
+        class_range = torch.arange(n_classes, device=self.device)
+        mask = ~(class_range.unsqueeze(0) == true_classes.unsqueeze(1))  # Shape: [n_failed, n_classes]
 
-                # Compute adjustments with bounds
-                raw_adjustments = self.learning_rate * (1 - true_probs/max_other_probs)
-                adjustments = torch.clamp(raw_adjustments, -0.5, 0.5)
+        # Get probabilities for true classes and max of other classes efficiently
+        true_probs = posteriors[torch.arange(n_failed, device=self.device), true_classes]  # Shape: [n_failed]
+        masked_posteriors = posteriors.masked_fill(~mask, float('-inf'))
+        max_other_probs = masked_posteriors.max(dim=1)[0]  # Shape: [n_failed]
 
-                # Update weights for each class
-                for class_idx, class_id in enumerate(self.likelihood_params['classes']):
-                    class_mask = (true_classes == class_id)
-                    if not class_mask.any():
-                        continue
+        # Compute adjustments vectorized with bounds
+        raw_adjustments = self.learning_rate * (1 - true_probs/max_other_probs)  # Shape: [n_failed]
+        adjustments = torch.clamp(raw_adjustments, -0.5, 0.5)
 
-                    class_adjustments = adjustments[class_mask].mean()
-                    self.current_W[class_idx] *= (1 + class_adjustments)
-                    self.current_W[class_idx].clamp_(1e-10, 10.0)
+        # Update weights for all classes simultaneously
+        class_adjustments = torch.zeros(n_classes, device=self.device)
+        for class_idx in range(n_classes):
+            class_mask = (true_classes == self.likelihood_params['classes'][class_idx])
+            if class_mask.any():
+                class_adjustments[class_idx] = adjustments[class_mask].mean()
+
+        # Apply updates to all weights simultaneously
+        self.current_W *= (1 + class_adjustments.unsqueeze(1))  # Broadcasting across features
+        self.current_W.clamp_(1e-10, 10.0)
 
 
 #---------------------------------------------------------------------------------------------------------
