@@ -647,51 +647,60 @@ class GPUDBNN:
             all_combinations = random.sample(all_combinations, max_combinations)
 
         return torch.tensor(all_combinations).to(self.device)
-
+#----------------------------------------------------------------------------------------------------------------------------------------------------------------------
     def _compute_pairwise_likelihood_parallel(self, dataset: torch.Tensor, labels: torch.Tensor, feature_dims: int):
+        """Compute likelihood parameters in parallel using feature groups"""
+        # Move data to GPU if available
         dataset = dataset.to(self.device)
         labels = labels.to(self.device)
+
+        # Get likelihood configuration
+        group_size = self.config.get('likelihood_config', {}).get('feature_group_size', 2)
+        max_combinations = self.config.get('likelihood_config', {}).get('max_combinations', None)
 
         # Generate feature combinations
         self.feature_pairs = self._generate_feature_combinations(
             feature_dims,
-            self.config['likelihood_config']['feature_group_size'],
-            self.config['likelihood_config']['max_combinations']
+            group_size,
+            max_combinations
         )
 
         unique_classes = torch.unique(labels)
+
+        # Initialize storage for likelihood parameters
         n_combinations = len(self.feature_pairs)
         n_classes = len(unique_classes)
-        group_size = self.feature_pairs.shape[1]
 
+        # Preallocate tensors on GPU
         means = torch.zeros((n_classes, n_combinations, group_size), device=self.device)
         covs = torch.zeros((n_classes, n_combinations, group_size, group_size), device=self.device)
-
-        # Create stability term
-        stability_term = torch.eye(group_size, device=self.device).unsqueeze(0).unsqueeze(0) * 1e-6
 
         for class_idx, class_id in enumerate(unique_classes):
             class_mask = (labels == class_id)
             class_data = dataset[class_mask]
-            n_samples = class_data.size(0)
 
-            # Extract features for all groups
+            # Extract all feature groups in parallel
+            # Reshape to handle arbitrary group sizes
             group_data = torch.stack([
-                class_data[:, pair] for pair in self.feature_pairs
-            ], dim=1)  # Shape: [n_samples, n_combinations, group_size]
+                class_data[:, self.feature_pairs[i]] for i in range(n_combinations)
+            ], dim=1)
 
-            # Compute means
+            # Compute means for all groups simultaneously
             means[class_idx] = torch.mean(group_data, dim=0)
 
-            # Center the data
+            # Compute covariances for all groups in parallel
             centered_data = group_data - means[class_idx].unsqueeze(0)
 
-            # Compute covariance matrices for all groups
-            for group_idx in range(n_combinations):
-                group_centered = centered_data[:, group_idx, :]  # [n_samples, group_size]
-                covs[class_idx, group_idx] = torch.matmul(
-                    group_centered.T, group_centered
-                ) / (n_samples - 1) + stability_term[0, 0]
+            # Update batch covariance computation for arbitrary group sizes
+            for i in range(n_combinations):
+                batch_cov = torch.mm(
+                    centered_data[:, i].T,
+                    centered_data[:, i]
+                ) / (len(class_data) - 1)
+                covs[class_idx, i] = batch_cov
+
+            # Add small diagonal term for numerical stability
+            covs[class_idx] += torch.eye(group_size, device=self.device) * 1e-6
 
         return {
             'means': means,
@@ -699,108 +708,110 @@ class GPUDBNN:
             'classes': unique_classes
         }
 
-
     def _compute_batch_posterior(self, features: torch.Tensor, epsilon: float = 1e-10):
+        """Compute posterior probabilities for a batch of samples using feature groups"""
         batch_size = features.shape[0]
         n_classes = len(self.likelihood_params['classes'])
-        n_combinations = len(self.feature_pairs)
+
+        # Get group size from feature pairs shape
         group_size = self.feature_pairs.shape[1]
 
-        # Extract all features for all groups simultaneously
+        # Extract groups for the batch
         batch_groups = torch.stack([
-            features[:, pair] for pair in self.feature_pairs
-        ], dim=1).to(torch.float64)  # [batch_size, n_combinations, group_size]
-
-        # Convert parameters to double precision
-        class_means = self.likelihood_params['means'].to(torch.float64)  # [n_classes, n_combinations, group_size]
-        class_covs = self.likelihood_params['covs'].to(torch.float64)    # [n_classes, n_combinations, group_size, group_size]
-
-        # Pre-compute log determinants for all classes and combinations
-        log_dets = torch.logdet(class_covs)  # [n_classes, n_combinations]
+            features[:, self.feature_pairs[i]] for i in range(len(self.feature_pairs))
+        ], dim=1)  # Shape: [batch_size, n_combinations, group_size]
 
         # Initialize log likelihoods
-        log_likelihoods = torch.zeros((batch_size, n_classes), device=self.device, dtype=torch.float64)
+        log_likelihoods = torch.zeros((batch_size, n_classes), device=self.device)
 
-        # Constants term
-        const_term = group_size * np.log(2 * np.pi)
-
-        # Vectorized computation for all classes
         for class_idx in range(n_classes):
-            # Center the data for all groups
-            centered = batch_groups - class_means[class_idx].unsqueeze(0)  # [batch_size, n_combinations, group_size]
+            # Get parameters for current class
+            class_means = self.likelihood_params['means'][class_idx]
+            class_covs = self.likelihood_params['covs'][class_idx]
+            class_priors = self.current_W[class_idx]
 
-            # Compute inverse of covariance matrices for all groups
-            inv_covs = torch.inverse(class_covs[class_idx])  # [n_combinations, group_size, group_size]
+            # Compute mahalanobis distance for all groups in parallel
+            centered = batch_groups - class_means.unsqueeze(0)
 
-            # Vectorized quadratic form computation for all samples and groups
-            # [batch_size, n_combinations, 1, group_size] @ [n_combinations, group_size, group_size]
-            # @ [batch_size, n_combinations, group_size, 1]
-            quad_form = torch.matmul(
-                torch.matmul(
-                    centered.unsqueeze(2),  # [batch_size, n_combinations, 1, group_size]
-                    inv_covs  # [n_combinations, group_size, group_size]
-                ),
-                centered.unsqueeze(-1)  # [batch_size, n_combinations, group_size, 1]
-            ).squeeze(-1).squeeze(-1)  # [batch_size, n_combinations]
+            # Compute inverse of covariance matrices
+            inv_covs = torch.inverse(class_covs)
 
-            # Compute log likelihood for all samples and groups
+            # Compute quadratic form for all samples and groups
+            quad_form = torch.zeros((batch_size, len(self.feature_pairs)), device=self.device)
+
+            for i in range(len(self.feature_pairs)):
+                quad_form[:, i] = torch.sum(
+                    torch.matmul(centered[:, i, :], inv_covs[i]) * centered[:, i, :],
+                    dim=1
+                )
+
+            # Compute log determinant
+            log_det = torch.logdet(class_covs)
+
+            # Compute log likelihood for all groups
             pair_log_likelihood = -0.5 * (
-                const_term +
-                log_dets[class_idx] +
+                group_size * np.log(2 * np.pi) +
+                log_det.unsqueeze(0) +
                 quad_form
             )
 
             # Add prior weights
-            class_prior = self.current_W[class_idx].to(torch.float64)
-            weighted_likelihood = pair_log_likelihood + torch.log(torch.clamp(class_prior, min=epsilon))
+            weighted_likelihood = pair_log_likelihood + torch.log(class_priors + epsilon)
+
+            # Sum over groups for each sample
             log_likelihoods[:, class_idx] = weighted_likelihood.sum(dim=1)
 
         # Compute posteriors using log-sum-exp trick
         max_log_likelihood = torch.max(log_likelihoods, dim=1, keepdim=True)[0]
-        exp_term = torch.exp(log_likelihoods - max_log_likelihood)
-        posteriors = exp_term / (exp_term.sum(dim=1, keepdim=True) + epsilon)
+        likelihoods = torch.exp(log_likelihoods - max_log_likelihood)
+        posteriors = likelihoods / (likelihoods.sum(dim=1, keepdim=True) + epsilon)
 
-        return posteriors.to(torch.float32)
-
+        return posteriors
 
     def _update_priors_parallel(self, failed_cases: List[Tuple], batch_size: int = 32):
-        if not failed_cases:
-            return
+            """Update priors in parallel for failed cases"""
+            n_failed = len(failed_cases)
+            n_batches = (n_failed + batch_size - 1) // batch_size
 
-        total_cases = len(failed_cases)
-        n_classes = len(self.likelihood_params['classes'])
+            for i in range(n_batches):
+                start_idx = i * batch_size
+                end_idx = min((i + 1) * batch_size, n_failed)
+                batch_cases = failed_cases[start_idx:end_idx]
 
-        if total_cases <= batch_size:
-            features = torch.stack([case[0] for case in failed_cases]).to(self.device)
-            true_classes = torch.tensor([case[1] for case in failed_cases]).to(self.device)
+                # Prepare batch data
+                features = torch.stack([case[0] for case in batch_cases]).to(self.device)
+                true_classes = torch.tensor([case[1] for case in batch_cases]).to(self.device)
 
-            posteriors = self._compute_batch_posterior(features)
+                # Compute posteriors for batch
+                posteriors = self._compute_batch_posterior(features)
 
-            class_mask = torch.zeros_like(posteriors, dtype=torch.bool)
-            class_mask[torch.arange(total_cases, device=self.device), true_classes] = True
+                # Create identity matrix on the same device
+                n_classes = len(self.likelihood_params['classes'])
+                eye_matrix = torch.eye(n_classes, device=self.device)
 
-            true_probs = posteriors[class_mask].view(total_cases)
-            other_probs = posteriors.masked_fill(class_mask, float('-inf'))
-            max_other_probs = torch.max(other_probs, dim=1)[0]
+                # Compute adjustments in parallel
+                true_probs = posteriors[torch.arange(len(batch_cases), device=self.device), true_classes]
+                max_other_probs = torch.max(
+                    posteriors * (1 - eye_matrix)[true_classes],
+                    dim=1
+                )[0]
 
-            adjustments = torch.clamp(
-                self.learning_rate * (1 - true_probs/max_other_probs),
-                min=-0.5,
-                max=0.5
-            )
+                # Compute adjustments with bounds
+                raw_adjustments = self.learning_rate * (1 - true_probs/max_other_probs)
+                adjustments = torch.clamp(raw_adjustments, -0.5, 0.5)
 
-            # Reshape class_adjustments to match current_W dimensions
-            class_adjustments = torch.zeros_like(self.current_W)
-            for class_id in range(n_classes):
-                class_mask = (true_classes == class_id)
-                if class_mask.any():
-                    class_adjustments[class_id] = adjustments[class_mask].mean()
+                # Update weights for each class
+                for class_idx, class_id in enumerate(self.likelihood_params['classes']):
+                    class_mask = (true_classes == class_id)
+                    if not class_mask.any():
+                        continue
 
-            # Update weights with proper broadcasting
-            self.current_W = self.current_W * (1 + class_adjustments)
-            self.current_W.clamp_(1e-10, 10.0)
+                    class_adjustments = adjustments[class_mask].mean()
+                    self.current_W[class_idx] *= (1 + class_adjustments)
+                    self.current_W[class_idx].clamp_(1e-10, 10.0)
 
 
+#---------------------------------------------------------------------------------------------------------
 
     def predict(self, X: torch.Tensor, batch_size: int = 32):
         """Make predictions in batches using the best model weights"""
