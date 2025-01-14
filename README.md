@@ -72,7 +72,8 @@ The DBNN implementation includes:
 
 The code follows a modular design pattern with a clear separation of concerns between data handling, model training, and evaluation components.
 
-# Adaptive Learning (What is there in a training sample?, 2009 World Congress on Nature & Biologically Inspired Computing (NaBIC), Coimbatore, India, 2009, pp. 1507-1511, doi: 10.1109/NABIC.2009.5393682.)
+# Adaptive Learning 
+### (What is there in a training sample?, 2009 World Congress on Nature & Biologically Inspired Computing (NaBIC), Coimbatore, India, 2009, pp. 1507-1511, doi: 10.1109/NABIC.2009.5393682.)
 
 The adaptive learning process in the code follows a specific strategy for including new examples based on misclassifications. Here's how it works:
 
