@@ -78,8 +78,11 @@ The code follows a modular design pattern with a clear separation of concerns be
 The adaptive learning process in the code follows a specific strategy for including new examples based on misclassifications. Here's how it works:
 
 ## Initial Training Set Creation
-The process starts by selecting one example per class from the dataset to form the initial training set[1]. This ensures the representation of all classes from the beginning.
-
+The process starts by selecting one example per class from the dataset to form the initial training set. This ensures the representation of all classes from the beginning.
+### cardinality_tolerance": -1 
+means the exact resolution of the input data will be used for analysis. If set to a positive number, the decimals will be rounded to that precision. 
+###   "random_seed": -1,
+means the input data will be randomised before analysis. A positive number can be used to get the exact data split for testing and training.
 ## Adaptive Learning Loop
 The key components of the adaptive learning process are:
 
