@@ -327,6 +327,14 @@ class GPUDBNN:
         # Load dataset configuration and data
         self.config = DatasetConfig.load_config(self.dataset_name)
         self.data = self._load_dataset()
+        #---------------------------Shuffle data if shuffle state is -1 -------------------
+        if  self.shuffle_state == -1:
+            # Perform 3 rounds of shuffling
+            tmpx=self.data
+            for _ in range(3):
+                tmpx = tmpx.sample(frac=1.0)
+            self.data=tmpx
+       #----------------------------------------------------------------------------------
         self.target_column = self.config['target_column']
 
         # Load saved weights and encoders
@@ -1543,12 +1551,7 @@ class GPUDBNN:
             batch_size: Batch size for training and prediction
             save_path: Path to save predictions CSV file. If None, predictions won't be saved
         """
-        if  self.shuffle_state == -1:
-            # Perform 3 rounds of shuffling
-            tmpx=self.data
-            for _ in range(3):
-                tmpx = tmpx.sample(frac=1.0)
-            self.data=tmpx
+
 
         # Prepare data
         X = self.data.drop(columns=[self.target_column])
