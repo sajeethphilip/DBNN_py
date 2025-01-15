@@ -278,10 +278,15 @@ class GPUDBNN:
         self.learning_rate = learning_rate
         self.max_epochs = max_epochs
         self.test_size = test_size
-        self.random_state = random_state
+        if random_state !=-1:
+            self.random_state = random_state
+            self.shuffle_state =1
+        else:
+            self.random_state =42
+            self.shuffle_state =-1
         #self.compute_dtype = torch.float64  # Use double precision for computations
         self.cardinality_tolerance = cardinality_tolerance  # Only for feature grouping
-
+        self.fresh_start = fresh
         # Handle fresh start after configuration is loaded
         if fresh:
             self._clean_existing_model()
@@ -303,7 +308,6 @@ class GPUDBNN:
         self.learning_rate = learning_rate
         self.max_epochs = max_epochs
         self.test_size = test_size
-        self.random_state = random_state
 
         # Model components
         self.scaler = StandardScaler()
@@ -393,7 +397,7 @@ class GPUDBNN:
         original_classes = self.label_encoder.inverse_transform(unique_classes)
         # Try to load last training epoch first
         last_epoch_file = os.path.join(self.base_save_path, f'{self.dataset_name}_last_epoch.txt')
-        if os.path.exists(last_epoch_file):
+        if os.path.exists(last_epoch_file) and not self.fresh_start:
             with open(last_epoch_file, 'r') as f:
                 last_epoch = int(f.read().strip())
             train_indices, test_indices = self.load_epoch_data(last_epoch)
@@ -557,29 +561,32 @@ class GPUDBNN:
         return cardinality_threshold
 
 
-    def _remove_high_cardinality_columns(self, df: pd.DataFrame, threshold: float = 0.8) -> pd.DataFrame:
-        # Only use cardinality_tolerance for feature grouping, not computations
-        df_grouped = df.round(cardinality_tolerance)  # For grouping only
-        df_filtered = df.copy()  # Keep original precision for computations
+    def _round_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Round features based on cardinality_tolerance"""
+        if cardinality_tolerance == -1:
+            return df
+        return df.round(cardinality_tolerance)
 
+    def _remove_high_cardinality_columns(self, df: pd.DataFrame, threshold: float = 0.8) -> pd.DataFrame:
+        """Remove high cardinality columns and round features"""
+        # Round all features first if cardinality_tolerance is not -1
+        df_rounded = self._round_features(df)
+
+        df_filtered = df_rounded.copy()
         columns_to_drop = []
+
         for column in df.columns:
             if column == self.target_column:
                 continue
-            # Use grouped data for cardinality check only
-            unique_ratio = len(df_grouped[column].unique()) / len(df)
+            # Use rounded data for cardinality check
+            unique_ratio = len(df_rounded[column].unique()) / len(df)
             if unique_ratio > threshold:
                 columns_to_drop.append(column)
 
         if columns_to_drop:
             df_filtered = df_filtered.drop(columns=columns_to_drop)
+
         return df_filtered
-
-
-
-
-
-
 
     def _generate_feature_combinations(self, n_features: int, group_size: int, max_combinations: int = None) -> torch.Tensor:
         """
@@ -604,18 +611,21 @@ class GPUDBNN:
             all_combinations = random.sample(all_combinations, max_combinations)
 
         return torch.tensor(all_combinations).to(self.device)
+
 #----------------------------------------------------------------------------------------------------------------------------------------------------------------------
     def _compute_pairwise_likelihood_parallel(self, dataset: torch.Tensor, labels: torch.Tensor, feature_dims: int):
-        """Compute likelihood parameters in parallel using feature groups with optimized vectorization"""
-        # Move data to GPU if available
+        """Compute likelihood parameters using rounded feature groups"""
+        # Round dataset according to cardinality_tolerance
+        if cardinality_tolerance != -1:
+            dataset = torch.round(dataset * 10**cardinality_tolerance) / 10**cardinality_tolerance
+
         dataset = dataset.to(self.device)
         labels = labels.to(self.device)
 
-        # Get likelihood configuration
+        # Match C++ code dimensions
         group_size = self.config.get('likelihood_config', {}).get('feature_group_size', 2)
         max_combinations = self.config.get('likelihood_config', {}).get('max_combinations', None)
 
-        # Generate feature combinations
         self.feature_pairs = self._generate_feature_combinations(
             feature_dims,
             group_size,
@@ -626,48 +636,33 @@ class GPUDBNN:
         n_combinations = len(self.feature_pairs)
         n_classes = len(unique_classes)
 
-        # Preallocate tensors on GPU
+        # Initialize with same dimensions as C++ code
         means = torch.zeros((n_classes, n_combinations, group_size), device=self.device)
         covs = torch.zeros((n_classes, n_combinations, group_size, group_size), device=self.device)
 
-        # Convert feature_pairs to tensor once and move to correct device
-        feature_pairs_tensor = self.feature_pairs.clone().detach().to(device=self.device)
-
-
-        # Pre-compute eye matrix for stability
-        stability_term = torch.eye(group_size, device=self.device).unsqueeze(0).unsqueeze(0) * 1e-6
-
+        # Process each class separately like C++ code
         for class_idx, class_id in enumerate(unique_classes):
             class_mask = (labels == class_id)
             class_data = dataset[class_mask]
-            n_samples = len(class_data)
 
-            # Vectorized feature extraction - reshape for batch processing
-            # Shape: (n_samples, n_combinations, group_size)
-            group_data = class_data[:, feature_pairs_tensor.view(-1)].view(
-                n_samples, n_combinations, group_size
-            )
+            # Group data using rounded values
+            group_data = torch.stack([
+                class_data[:, pair] for pair in self.feature_pairs
+            ], dim=1)
 
-            # Compute means for all groups simultaneously
+            # Compute means using rounded data
             means[class_idx] = torch.mean(group_data, dim=0)
 
-            # Center the data once for all groups
+            # Compute covariances using rounded data
             centered_data = group_data - means[class_idx].unsqueeze(0)
+            for i in range(n_combinations):
+                covs[class_idx, i] = torch.mm(
+                    centered_data[:, i].T,
+                    centered_data[:, i]
+                ) / (len(class_data) - 1)
 
-            # Vectorized covariance computation for all groups at once
-            # Reshape for batch matrix multiplication
-            # (n_samples, n_combinations, group_size) -> (n_combinations, n_samples, group_size)
-            centered_data_t = centered_data.transpose(0, 1)
-
-            # Compute all covariances in one operation
-            # Shape: (n_combinations, group_size, group_size)
-            covs[class_idx] = torch.matmul(
-                centered_data_t.transpose(-2, -1),  # (n_combinations, group_size, n_samples)
-                centered_data_t  # (n_combinations, n_samples, group_size)
-            ) / (n_samples - 1)
-
-        # Add small diagonal term for numerical stability
-        covs += stability_term
+        # Add stability term as in C++ code
+        covs += torch.eye(group_size, device=self.device).unsqueeze(0).unsqueeze(0) * 1e-6
 
         return {
             'means': means,
@@ -973,7 +968,6 @@ class GPUDBNN:
             previous_best_error = self.best_error
         """Train the model using batch processing"""
         # Move data to device
-
         X_train = X_train.to(self.device)
         y_train = y_train.to(self.device)
         X_test = X_test.to(self.device)
@@ -1549,6 +1543,12 @@ class GPUDBNN:
             batch_size: Batch size for training and prediction
             save_path: Path to save predictions CSV file. If None, predictions won't be saved
         """
+        if  self.shuffle_state == -1:
+            # Perform 3 rounds of shuffling
+            tmpx=self.data
+            for _ in range(3):
+                tmpx = tmpx.sample(frac=1.0)
+            self.data=tmpx
 
         # Prepare data
         X = self.data.drop(columns=[self.target_column])
