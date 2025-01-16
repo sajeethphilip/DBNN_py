@@ -402,18 +402,19 @@ class GPUDBNN:
         return train_indices, test_indices
 
     def adaptive_fit_predict(self, max_rounds: int = 10,
-                           improvement_threshold: float = 0.001,
-                           load_epoch: int = None,
-                           batch_size: int = 32):
+                            improvement_threshold: float = 0.001,
+                            load_epoch: int = None,
+                            batch_size: int = 32):
         """
-        Adaptive training strategy using saved predictions from fit_predict
+        Adaptive training strategy using saved predictions from fit_predict.
+        Only tests on unused data to avoid bias in selecting new training examples.
         """
 
         if not EnableAdaptive:
             print("Adaptive learning is disabled. Using standard training.")
             return self.fit_predict(batch_size=batch_size)
 
-        self.in_adaptive_fit=True
+        self.in_adaptive_fit = True
         # Get initial data (using class members)
         X = self.data.drop(columns=[self.target_column])
         y = self.data[self.target_column]
@@ -422,6 +423,7 @@ class GPUDBNN:
         y_encoded = self.label_encoder.fit_transform(y)
         unique_classes = np.unique(y_encoded)
         original_classes = self.label_encoder.inverse_transform(unique_classes)
+
         # Try to load last training epoch first
         last_epoch_file = os.path.join(self.base_save_path, f'{self.dataset_name}_last_epoch.txt')
         if os.path.exists(last_epoch_file) and not self.fresh_start:
@@ -429,14 +431,13 @@ class GPUDBNN:
                 last_epoch = int(f.read().strip())
             train_indices, test_indices = self.load_epoch_data(last_epoch)
             start_round = last_epoch + 1
-            max_rounds=max_rounds+start_round
+            max_rounds = max_rounds + start_round
             print(f"Continuing from epoch {last_epoch}")
             # Then try specified epoch
             if load_epoch is not None:
                 train_indices, test_indices = self.load_epoch_data(load_epoch)
                 start_round = load_epoch + 1
                 print(f"Loading data from epoch {load_epoch}")
-            # Otherwise start fresh
         else:
             # Initialize with one example per class
             train_indices = []
@@ -450,11 +451,15 @@ class GPUDBNN:
             for class_label in unique_classes:
                 train_indices.append(class_indices[class_label][0])
 
+            # Initialize test_indices with all remaining indices
+            all_indices = set(range(len(X)))
+            test_indices = list(all_indices - set(train_indices))
             start_round = 0
 
         history = {
             'round': [],
             'train_size': [],
+            'test_size': [],
             'accuracy': [],
             'misclassified': []
         }
@@ -465,12 +470,15 @@ class GPUDBNN:
         for round_num in range(start_round, max_rounds):
             print(f"\nRound {round_num + 1}/{max_rounds}")
             print(f"Training set size: {len(train_indices)}")
+            print(f"Test set size: {len(test_indices)}")
 
-            # Split data
-            train_mask = torch.zeros(len(X), dtype=torch.bool,device=self.device)
+            # Create masks only for current train/test split
+            train_mask = torch.zeros(len(X), dtype=torch.bool, device=self.device)
             train_mask[train_indices] = True
-            test_mask = ~train_mask
-            test_indices = torch.where(test_mask)[0].tolist()
+
+            # Create test data only from unused examples
+            test_mask = torch.zeros(len(X), dtype=torch.bool, device=self.device)
+            test_mask[test_indices] = True
 
             # Save current epoch data
             self.save_epoch_data(round_num, train_indices, test_indices)
@@ -490,14 +498,17 @@ class GPUDBNN:
             # Read predictions and probabilities from saved file
             predictions_df = pd.read_csv(save_path)
 
-            predictions = predictions_df['predicted_class'].values
-            true_labels = predictions_df['true_class'].values
+            # Filter predictions to only include test set
+            test_predictions_df = predictions_df[predictions_df.index.isin(test_indices)]
+
+            predictions = test_predictions_df['predicted_class'].values
+            true_labels = test_predictions_df['true_class'].values
 
             # Get probability columns using original class labels
             prob_columns = [f'prob_{class_label}' for class_label in original_classes]
-            probabilities = predictions_df[prob_columns].values
+            probabilities = test_predictions_df[prob_columns].values
 
-            # Find misclassified examples
+            # Find misclassified examples in test set
             misclassified_mask = (predictions != true_labels)
             misclassified_indices = np.where(misclassified_mask)[0]
 
@@ -508,6 +519,7 @@ class GPUDBNN:
             # Update history
             history['round'].append(round_num + 1)
             history['train_size'].append(len(train_indices))
+            history['test_size'].append(len(test_indices))
             history['accuracy'].append(current_accuracy)
             history['misclassified'].append(len(misclassified_indices))
 
@@ -522,23 +534,7 @@ class GPUDBNN:
                 rounds_without_improvement += 1
                 if rounds_without_improvement >= 3:
                     print("No improvement for 3 rounds. Stopping early.")
-                    # Select most confident misclassifications
-                    new_train_indices = []
-                    for class_idx, class_label in enumerate(unique_classes):
-                        # Find misclassified examples predicted as this class
-                        class_mask = (predictions == class_label) & misclassified_mask
-                        if np.any(class_mask):
-                            # Get probabilities for predicted class using original class label
-                            original_class = original_classes[class_idx]
-                            prob_col = f'prob_{original_class}'
-                            class_probs = predictions_df[prob_col].values[class_mask]
-                            max_prob_idx = np.argmax(class_probs)
-                            # Map back to original dataset index
-                            original_idx = test_indices[np.where(class_mask)[0][max_prob_idx]]
-                            new_train_indices.append(original_idx)
-
-                    train_indices.extend(new_train_indices)
-                    continue
+                    break
 
             if len(misclassified_indices) == 0:
                 print("All examples correctly classified. Stopping.")
@@ -553,13 +549,13 @@ class GPUDBNN:
                     # Get probabilities for predicted class using original class label
                     original_class = original_classes[class_idx]
                     prob_col = f'prob_{original_class}'
-                    class_probs = predictions_df[prob_col].values[class_mask]
+                    class_probs = test_predictions_df[prob_col].values[class_mask]
 
                     # Get indices of both max and min probability cases
                     max_prob_idx = np.argmax(class_probs)
                     min_prob_idx = np.argmin(class_probs)
 
-                    # Map back to original dataset indices
+                    # Map back to original dataset indices using test_indices
                     mask_indices = np.where(class_mask)[0]
                     max_original_idx = test_indices[mask_indices[max_prob_idx]]
                     min_original_idx = test_indices[mask_indices[min_prob_idx]]
@@ -567,8 +563,10 @@ class GPUDBNN:
                     # Add both indices to new training set
                     new_train_indices.extend([max_original_idx, min_original_idx])
 
+            # Update train and test sets
             train_indices.extend(new_train_indices)
-
+            # Remove newly added training examples from test set
+            test_indices = list(set(test_indices) - set(new_train_indices))
 
             # Clean up prediction file if needed
             if os.path.exists(save_path):
@@ -579,7 +577,7 @@ class GPUDBNN:
             json.dump(history, f)
         # Save final training/testing split
         self.save_last_split(train_indices, test_indices)
-        self.in_adaptive_fit=False
+        self.in_adaptive_fit = False
         return history
 
 
@@ -646,7 +644,8 @@ class GPUDBNN:
     def _compute_pairwise_likelihood_parallel(self, dataset: torch.Tensor, labels: torch.Tensor, feature_dims: int):
         """
         Optimized non-parametric likelihood computation using adaptive binning.
-        Maintains exact same joint probability estimation logic with improved performance.
+        Maintains raw counts for proper probability updates during retraining.
+        Returns both raw counts and normalized probabilities.
         """
         # Input validation
         if dataset is None or labels is None:
@@ -689,7 +688,8 @@ class GPUDBNN:
 
         # Pre-allocate storage
         all_bin_edges = []
-        all_bin_counts = []
+        all_bin_counts = []  # Store raw counts
+        all_bin_probs = []   # Store normalized probabilities
 
         # Process each feature group efficiently
         for feature_group in self.feature_pairs:
@@ -732,46 +732,44 @@ class GPUDBNN:
                     class_data = group_data[class_mask].contiguous()
 
                     if n_dims == 2:  # Optimized path for pairs
-                        # Compute bin indices for both dimensions at once
                         bin_indices = torch.stack([
                             torch.bucketize(class_data[:, dim].contiguous(),
                                           bin_edges[dim].contiguous()) - 1
                             for dim in range(2)
                         ]).clamp_(0, n_bins_per_dim - 1)
 
-                        # Compute flat indices for scatter_add
                         flat_indices = bin_indices[0] * n_bins_per_dim + bin_indices[1]
-
-                        # Use scatter_add for efficient counting
                         counts = torch.zeros(n_bins_per_dim * n_bins_per_dim, device=self.device)
                         counts.scatter_add_(0, flat_indices,
                                          torch.ones(len(flat_indices), device=self.device))
-
                         bin_counts[class_idx] = counts.reshape(n_bins_per_dim, n_bins_per_dim)
 
                     else:  # General case for any number of dimensions
-                        # Compute bin indices for all dimensions
                         bin_indices = torch.stack([
                             torch.bucketize(class_data[:, dim].contiguous(),
                                           bin_edges[dim].contiguous()) - 1
                             for dim in range(n_dims)
                         ]).clamp_(0, n_bins_per_dim - 1)
 
-                        # Convert to multi-dimensional indices
                         for sample_idx in range(len(class_data)):
                             sample_indices = tuple(bin_indices[:, sample_idx])
                             bin_counts[class_idx][sample_indices] += 1
 
-            # Vectorized smoothing and normalization
-            bin_counts.add_(1.0)  # Laplace smoothing
-            bin_counts.div_(bin_counts.sum(dim=tuple(range(1, n_dims + 1)), keepdim=True))
+            # Store raw counts (with Laplace smoothing)
+            smoothed_counts = bin_counts.clone() + 1.0
+
+            # Compute normalized probabilities separately
+            bin_probs = smoothed_counts.clone()
+            bin_probs.div_(bin_probs.sum(dim=tuple(range(1, n_dims + 1)), keepdim=True))
 
             all_bin_edges.append(bin_edges)
-            all_bin_counts.append(bin_counts)
+            all_bin_counts.append(smoothed_counts)  # Store smoothed counts
+            all_bin_probs.append(bin_probs)         # Store normalized probabilities
 
         return {
             'bin_edges': all_bin_edges,
-            'bin_counts': all_bin_counts,
+            'bin_counts': all_bin_counts,    # Raw counts (with smoothing)
+            'bin_probs': all_bin_probs,      # Normalized probabilities
             'feature_pairs': self.feature_pairs,
             'classes': unique_classes
         }
@@ -779,8 +777,7 @@ class GPUDBNN:
 
     def _compute_batch_posterior(self, features: torch.Tensor, epsilon: float = 1e-10):
         """
-        Optimized computation of posterior probabilities using joint probability estimation.
-        Preserves feature interactions within groups while maximizing computational efficiency.
+        Optimized computation of posterior probabilities using pre-computed bin probabilities.
 
         Args:
             features: Input features tensor of shape [batch_size, n_features]
@@ -798,7 +795,8 @@ class GPUDBNN:
         # Process feature groups with minimal memory allocation
         for group_idx, feature_group in enumerate(self.likelihood_params['feature_pairs']):
             bin_edges = self.likelihood_params['bin_edges'][group_idx]
-            bin_counts = self.likelihood_params['bin_counts'][group_idx]
+            # Use pre-computed probabilities instead of counts
+            bin_probs = self.likelihood_params['bin_probs'][group_idx]
 
             # Extract and make group data contiguous in one operation
             group_data = features[:, feature_group].contiguous()
@@ -814,18 +812,18 @@ class GPUDBNN:
                     group_data[:, dim].contiguous(),
                     bin_edges[dim].contiguous()
                 ) - 1
-                indices[dim].clamp_(0, bin_counts.shape[1] - 1)
+                indices[dim].clamp_(0, bin_probs.shape[1] - 1)
 
             # Compute group log likelihoods for all classes at once
             if n_dims == 2:  # Optimized path for common case of pairs
                 # Convert 2D indices to flat indices for efficient lookup
-                flat_indices = (indices[0] * bin_counts.shape[1] + indices[1])
+                flat_indices = (indices[0] * bin_probs.shape[1] + indices[1])
 
-                # Reshape bin_counts for efficient indexing
-                flat_bin_counts = bin_counts.reshape(n_classes, -1)
+                # Reshape bin_probs for efficient indexing
+                flat_bin_probs = bin_probs.reshape(n_classes, -1)
 
                 # Vectorized lookup for all classes
-                group_probs = flat_bin_counts[:, flat_indices]  # [n_classes, batch_size]
+                group_probs = flat_bin_probs[:, flat_indices]  # [n_classes, batch_size]
                 group_log_likelihoods = torch.log(group_probs + epsilon).T  # [batch_size, n_classes]
 
             else:  # General case for any group size
@@ -834,7 +832,7 @@ class GPUDBNN:
 
                 # Efficient indexing for each class
                 for class_idx in range(n_classes):
-                    probs = bin_counts[class_idx][tuple(indices)]
+                    probs = bin_probs[class_idx][tuple(indices)]
                     group_log_likelihoods[:, class_idx] = torch.log(probs + epsilon)
 
             # Apply feature weights if they exist using efficient broadcasting
@@ -851,15 +849,6 @@ class GPUDBNN:
         posteriors = likelihoods.div_(likelihoods.sum(dim=1, keepdim=True) + epsilon)
 
         return posteriors
-
-    def initialize_weights(self):
-        """
-        Efficient weight initialization with single allocation.
-        """
-        if not hasattr(self, 'current_W'):
-            n_classes = len(self.likelihood_params['classes'])
-            n_groups = len(self.likelihood_params['feature_pairs'])
-            self.current_W = torch.ones((n_classes, n_groups), device=self.device)
 #----------------------------------------------------------------------------------------------------------------------------------------------------------------------
     def _compute_pairwise_likelihood_parallel_std(self, dataset: torch.Tensor, labels: torch.Tensor, feature_dims: int):
         """Compute likelihood parameters using rounded feature groups"""
