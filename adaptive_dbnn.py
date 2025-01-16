@@ -22,7 +22,7 @@ from itertools import combinations
 import torch
 import os
 import pickle
-
+import configparser
 #------------------------------------------------------------------------Declarations---------------------
 Trials = 100  # Number of epochs to wait for improvement in training
 cardinality_threshold =0.9
@@ -365,9 +365,9 @@ class GPUDBNN:
         epoch_dir = os.path.join(self.base_save_path, f'epoch_{epoch}')
         os.makedirs(epoch_dir, exist_ok=True)
 
-        with open(os.path.join(epoch_dir, 'train_indices.pkl'), 'wb') as f:
+        with open(os.path.join(epoch_dir, f'{modelType}_train_indices.pkl'), 'wb') as f:
             pickle.dump(train_indices, f)
-        with open(os.path.join(epoch_dir, 'test_indices.pkl'), 'wb') as f:
+        with open(os.path.join(epoch_dir, f'{modelType}_test_indices.pkl'), 'wb') as f:
             pickle.dump(test_indices, f)
 
     def load_epoch_data(self, epoch: int):
@@ -376,9 +376,9 @@ class GPUDBNN:
         """
         epoch_dir = os.path.join(self.base_save_path, f'epoch_{epoch}')
 
-        with open(os.path.join(epoch_dir, 'train_indices.pkl'), 'rb') as f:
+        with open(os.path.join(epoch_dir, f'{modelType}_train_indices.pkl'), 'rb') as f:
             train_indices = pickle.load(f)
-        with open(os.path.join(epoch_dir, 'test_indices.pkl'), 'rb') as f:
+        with open(os.path.join(epoch_dir, f'{modelType}_test_indices.pkl'), 'rb') as f:
             test_indices = pickle.load(f)
 
         return train_indices, test_indices
@@ -412,12 +412,12 @@ class GPUDBNN:
             start_round = last_epoch + 1
             max_rounds=max_rounds+start_round
             print(f"Continuing from epoch {last_epoch}")
-        # Then try specified epoch
-        elif load_epoch is not None:
-            train_indices, test_indices = self.load_epoch_data(load_epoch)
-            start_round = load_epoch + 1
-            print(f"Loading data from epoch {load_epoch}")
-        # Otherwise start fresh
+            # Then try specified epoch
+            if load_epoch is not None:
+                train_indices, test_indices = self.load_epoch_data(load_epoch)
+                start_round = load_epoch + 1
+                print(f"Loading data from epoch {load_epoch}")
+            # Otherwise start fresh
         else:
             # Initialize with one example per class
             train_indices = []
@@ -553,7 +553,7 @@ class GPUDBNN:
                 os.remove(save_path)
 
         # Save final history
-        with open(os.path.join(self.base_save_path, 'training_history.json'), 'w') as f:
+        with open(os.path.join(self.base_save_path, f'{modelType}_training_history.json'), 'w') as f:
             json.dump(history, f)
         # Save final training/testing split
         self.save_last_split(train_indices, test_indices)
@@ -619,9 +619,227 @@ class GPUDBNN:
             all_combinations = random.sample(all_combinations, max_combinations)
 
         return torch.tensor(all_combinations).to(self.device)
+#-----------------------------------------------------------------------------Bin model ---------------------------
 
-#----------------------------------------------------------------------------------------------------------------------------------------------------------------------
     def _compute_pairwise_likelihood_parallel(self, dataset: torch.Tensor, labels: torch.Tensor, feature_dims: int):
+        """
+        Optimized non-parametric likelihood computation using adaptive binning.
+        Maintains exact same joint probability estimation logic with improved performance.
+        """
+        # Input validation
+        if dataset is None or labels is None:
+            raise ValueError("Dataset and labels cannot be None")
+
+        # Ensure contiguous tensors once at the start
+        dataset = torch.as_tensor(dataset, device=self.device).contiguous()
+        labels = torch.as_tensor(labels, device=self.device).contiguous()
+
+        # Validation checks
+        if dataset.dim() != 2:
+            raise ValueError(f"Dataset must be 2-dimensional, got shape {dataset.shape}")
+        if labels.dim() != 1:
+            raise ValueError(f"Labels must be 1-dimensional, got shape {labels.shape}")
+        if len(dataset) != len(labels):
+            raise ValueError(f"Dataset and labels must have same length, got {len(dataset)} and {len(labels)}")
+        if dataset.shape[1] != feature_dims:
+            raise ValueError(f"Dataset must have {feature_dims} features, got {dataset.shape[1]}")
+
+        # Configuration setup
+        likelihood_config = getattr(self, 'config', {}).get('likelihood_config', {})
+        group_size = self.config.get('likelihood_config', {}).get('feature_group_size', 2)
+        max_combinations = self.config.get('likelihood_config', {}).get('max_combinations', None)
+
+        # Generate feature combinations once
+        self.feature_pairs = self._generate_feature_combinations(
+            feature_dims,
+            group_size,
+            max_combinations
+        )
+
+        if len(self.feature_pairs) == 0:
+            raise ValueError("No feature groups generated")
+
+        # Pre-compute class information
+        unique_classes, class_counts = torch.unique(labels, return_counts=True)
+        n_classes = len(unique_classes)
+        n_samples = len(dataset)
+        n_bins_per_dim = max(5, min(20, int(pow(n_samples, 1/3))))
+
+        # Pre-allocate storage
+        all_bin_edges = []
+        all_bin_counts = []
+
+        # Process each feature group efficiently
+        for feature_group in self.feature_pairs:
+            if isinstance(feature_group, torch.Tensor):
+                feature_group = feature_group.tolist()
+            feature_group = [int(x) for x in feature_group]
+
+            if not all(0 <= idx < feature_dims for idx in feature_group):
+                raise ValueError(f"Invalid feature indices in group: {feature_group}")
+
+            # Extract group data efficiently
+            group_data = dataset[:, feature_group].contiguous()
+            n_dims = len(feature_group)
+
+            # Compute bin edges for all dimensions at once
+            bin_edges = []
+            for dim in range(n_dims):
+                dim_data = group_data[:, dim]
+                dim_min, dim_max = dim_data.min(), dim_data.max()
+
+                if torch.abs(dim_max - dim_min) < 1e-10:
+                    dim_min -= 0.5
+                    dim_max += 0.5
+                else:
+                    padding = (dim_max - dim_min) * 0.01
+                    dim_min -= padding
+                    dim_max += padding
+
+                edges = torch.linspace(dim_min, dim_max, n_bins_per_dim + 1, device=self.device)
+                bin_edges.append(edges.contiguous())
+
+            # Initialize bin counts efficiently
+            bin_shape = [n_classes] + [n_bins_per_dim] * n_dims
+            bin_counts = torch.zeros(bin_shape, device=self.device)
+
+            # Process each class with vectorized operations
+            for class_idx, class_label in enumerate(unique_classes):
+                class_mask = labels == class_label
+                if class_mask.any():
+                    class_data = group_data[class_mask].contiguous()
+
+                    if n_dims == 2:  # Optimized path for pairs
+                        # Compute bin indices for both dimensions at once
+                        bin_indices = torch.stack([
+                            torch.bucketize(class_data[:, dim].contiguous(),
+                                          bin_edges[dim].contiguous()) - 1
+                            for dim in range(2)
+                        ]).clamp_(0, n_bins_per_dim - 1)
+
+                        # Compute flat indices for scatter_add
+                        flat_indices = bin_indices[0] * n_bins_per_dim + bin_indices[1]
+
+                        # Use scatter_add for efficient counting
+                        counts = torch.zeros(n_bins_per_dim * n_bins_per_dim, device=self.device)
+                        counts.scatter_add_(0, flat_indices,
+                                         torch.ones(len(flat_indices), device=self.device))
+
+                        bin_counts[class_idx] = counts.reshape(n_bins_per_dim, n_bins_per_dim)
+
+                    else:  # General case for any number of dimensions
+                        # Compute bin indices for all dimensions
+                        bin_indices = torch.stack([
+                            torch.bucketize(class_data[:, dim].contiguous(),
+                                          bin_edges[dim].contiguous()) - 1
+                            for dim in range(n_dims)
+                        ]).clamp_(0, n_bins_per_dim - 1)
+
+                        # Convert to multi-dimensional indices
+                        for sample_idx in range(len(class_data)):
+                            sample_indices = tuple(bin_indices[:, sample_idx])
+                            bin_counts[class_idx][sample_indices] += 1
+
+            # Vectorized smoothing and normalization
+            bin_counts.add_(1.0)  # Laplace smoothing
+            bin_counts.div_(bin_counts.sum(dim=tuple(range(1, n_dims + 1)), keepdim=True))
+
+            all_bin_edges.append(bin_edges)
+            all_bin_counts.append(bin_counts)
+
+        return {
+            'bin_edges': all_bin_edges,
+            'bin_counts': all_bin_counts,
+            'feature_pairs': self.feature_pairs,
+            'classes': unique_classes
+        }
+
+
+    def _compute_batch_posterior(self, features: torch.Tensor, epsilon: float = 1e-10):
+        """
+        Optimized computation of posterior probabilities using joint probability estimation.
+        Preserves feature interactions within groups while maximizing computational efficiency.
+
+        Args:
+            features: Input features tensor of shape [batch_size, n_features]
+            epsilon: Small value for numerical stability
+
+        Returns:
+            posteriors: Tensor of posterior probabilities [batch_size, n_classes]
+        """
+        batch_size = features.shape[0]
+        n_classes = len(self.likelihood_params['classes'])
+
+        # Pre-allocate log likelihoods tensor
+        log_likelihoods = torch.zeros((batch_size, n_classes), device=self.device)
+
+        # Process feature groups with minimal memory allocation
+        for group_idx, feature_group in enumerate(self.likelihood_params['feature_pairs']):
+            bin_edges = self.likelihood_params['bin_edges'][group_idx]
+            bin_counts = self.likelihood_params['bin_counts'][group_idx]
+
+            # Extract and make group data contiguous in one operation
+            group_data = features[:, feature_group].contiguous()
+
+            # Pre-allocate indices tensor for all dimensions
+            n_dims = len(feature_group)
+            indices = torch.empty((n_dims, batch_size), dtype=torch.long, device=self.device)
+
+            # Vectorized bin assignment for all dimensions
+            for dim in range(n_dims):
+                # Process each dimension with minimal temporary tensors
+                indices[dim] = torch.bucketize(
+                    group_data[:, dim].contiguous(),
+                    bin_edges[dim].contiguous()
+                ) - 1
+                indices[dim].clamp_(0, bin_counts.shape[1] - 1)
+
+            # Compute group log likelihoods for all classes at once
+            if n_dims == 2:  # Optimized path for common case of pairs
+                # Convert 2D indices to flat indices for efficient lookup
+                flat_indices = (indices[0] * bin_counts.shape[1] + indices[1])
+
+                # Reshape bin_counts for efficient indexing
+                flat_bin_counts = bin_counts.reshape(n_classes, -1)
+
+                # Vectorized lookup for all classes
+                group_probs = flat_bin_counts[:, flat_indices]  # [n_classes, batch_size]
+                group_log_likelihoods = torch.log(group_probs + epsilon).T  # [batch_size, n_classes]
+
+            else:  # General case for any group size
+                # Pre-allocate group likelihoods
+                group_log_likelihoods = torch.empty((batch_size, n_classes), device=self.device)
+
+                # Efficient indexing for each class
+                for class_idx in range(n_classes):
+                    probs = bin_counts[class_idx][tuple(indices)]
+                    group_log_likelihoods[:, class_idx] = torch.log(probs + epsilon)
+
+            # Apply feature weights if they exist using efficient broadcasting
+            if hasattr(self, 'current_W'):
+                group_weights = self.current_W[:, group_idx]  # [n_classes]
+                group_log_likelihoods.add_(torch.log(group_weights + epsilon).unsqueeze(0))
+
+            # Accumulate log likelihoods
+            log_likelihoods.add_(group_log_likelihoods)
+
+        # Compute posteriors using stable log-sum-exp
+        max_log_likelihood = log_likelihoods.max(dim=1, keepdim=True)[0]
+        likelihoods = torch.exp(log_likelihoods.sub_(max_log_likelihood))
+        posteriors = likelihoods.div_(likelihoods.sum(dim=1, keepdim=True) + epsilon)
+
+        return posteriors
+
+    def initialize_weights(self):
+        """
+        Efficient weight initialization with single allocation.
+        """
+        if not hasattr(self, 'current_W'):
+            n_classes = len(self.likelihood_params['classes'])
+            n_groups = len(self.likelihood_params['feature_pairs'])
+            self.current_W = torch.ones((n_classes, n_groups), device=self.device)
+#----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+    def _compute_pairwise_likelihood_parallel_std(self, dataset: torch.Tensor, labels: torch.Tensor, feature_dims: int):
         """Compute likelihood parameters using rounded feature groups"""
         # Round dataset according to cardinality_tolerance
         if cardinality_tolerance != -1:
@@ -678,7 +896,7 @@ class GPUDBNN:
             'classes': unique_classes
         }
 
-    def _compute_batch_posterior(self, features: torch.Tensor, epsilon: float = 1e-10):
+    def _compute_batch_posterior_std(self, features: torch.Tensor, epsilon: float = 1e-10):
         """
         Compute posterior probabilities for a batch of samples using feature groups.
         Optimized version using parallel computation and vectorized operations.
@@ -773,9 +991,16 @@ class GPUDBNN:
         # Ensure true_classes is on the correct device from the start
         true_classes = torch.tensor([case[1] for case in failed_cases], device=self.device)
 
-        # Compute posteriors for all cases at once
-        posteriors = self._compute_batch_posterior(features)  # Shape: [n_failed, n_classes]
+        if modelType=="Histogram":
 
+            # Compute posteriors for all cases at once
+            posteriors = self._compute_batch_posterior(features)  # Shape: [n_failed, n_classes]
+        elif modelType=="Gaussian":
+
+            # Compute posteriors for all cases at once
+            posteriors = self._compute_batch_posterior_std(features)  # Shape: [n_failed, n_classes]
+        else:
+            print(f"{modelType} is invalid. Please edit configutation file")
         n_classes = len(self.likelihood_params['classes'])
 
         # Create class range tensor directly on the correct device
@@ -867,7 +1092,17 @@ class GPUDBNN:
         try:
             for i in range(0, len(X), batch_size):
                 batch_X = X[i:min(i + batch_size, len(X))]
-                posteriors = self._compute_batch_posterior(batch_X)
+                if modelType=="Histogram":
+
+                    # Compute posteriors for all cases at once
+                    posteriors = self._compute_batch_posterior(batch_X)  # Shape: [n_failed, n_classes]
+                elif modelType=="Gaussian":
+
+                    # Compute posteriors for all cases at once
+                    posteriors = self._compute_batch_posterior_std(batch_X)  # Shape: [n_failed, n_classes]
+                else:
+                    print(f"{modelType} is invalid. Please edit configutation file")
+
                 batch_predictions = torch.argmax(posteriors, dim=1)
                 predictions.append(batch_predictions)
 
@@ -999,13 +1234,23 @@ class GPUDBNN:
             if self.keyboard_listener:
                 self.keyboard_listener.start()
         # Compute likelihood parameters
+        if modelType=="Histogram":
 
-        self.likelihood_params = self._compute_pairwise_likelihood_parallel(
-            X_train, y_train, X_train.shape[1]
-        )
+            self.likelihood_params = self._compute_pairwise_likelihood_parallel(
+                X_train, y_train, X_train.shape[1]
+            )
+        elif modelType=="Gaussian":
+            self.likelihood_params = self._compute_pairwise_likelihood_parallel_std(
+                X_train, y_train, X_train.shape[1]
+            )
+        else:
+            print(f"{modelType} is invalid. Please edit configuration file.")
         # Initialize weights if not loaded
+
         if self.current_W is None:
+
             n_pairs = len(self.feature_pairs)
+
             n_classes = len(self.likelihood_params['classes'])
             self.current_W = torch.full(
                 (n_classes, n_pairs),
@@ -1035,7 +1280,16 @@ class GPUDBNN:
                 batch_y = batch_y.to(self.device)  # Ensure batch_y is on correct device
 
                 # Compute posteriors for batch
-                posteriors = self._compute_batch_posterior(batch_X)
+                if modelType=="Histogram":
+
+                    # Compute posteriors for all cases at once
+                    posteriors = self._compute_batch_posterior(batch_X)  # Shape: [n_failed, n_classes]
+                elif modelType=="Gaussian":
+
+                    # Compute posteriors for all cases at once
+                    posteriors = self._compute_batch_posterior_std(batch_X)  # Shape: [n_failed, n_classes]
+                else:
+                    print(f"{modelType} is invalid. Please edit configutation file")
                 predictions = torch.argmax(posteriors, dim=1).to(self.device)
 
                 # Track failures - now both tensors are on same device
@@ -1196,7 +1450,17 @@ class GPUDBNN:
             batch_end = min(i + batch_size, len(X_tensor))
             batch_X = X_tensor[i:batch_end]
             # Get probabilities for this batch
-            batch_probs = self._compute_batch_posterior(batch_X)
+            if modelType=="Histogram":
+
+                # Compute posteriors for all cases at once
+                batch_probs = self._compute_batch_posterior(batch_X)  # Shape: [n_failed, n_classes]
+            elif modelType=="Gaussian":
+
+                # Compute posteriors for all cases at once
+                batch_probs = self._compute_batch_posterior_std(batch_X)  # Shape: [n_failed, n_classes]
+            else:
+                print(f"{modelType} is invalid. Please edit configutation file")
+
             all_probabilities.append(batch_probs.cpu().numpy())
         # Combine all batch probabilities
         all_probabilities = np.vstack(all_probabilities)
@@ -1341,11 +1605,11 @@ class GPUDBNN:
 
     def _get_weights_filename(self):
         """Get the filename for saving/loading weights"""
-        return os.path.join('Model', f'Best_{self.dataset_name}_weights.json')
+        return os.path.join('Model', f'Best_{modelType}_{self.dataset_name}_weights.json')
 
     def _get_encoders_filename(self):
         """Get the filename for saving/loading categorical encoders"""
-        return os.path.join('Model', f'Best_{self.dataset_name}_encoders.json')
+        return os.path.join('Model', f'Best_{modelType}_{self.dataset_name}_encoders.json')
 
 
 
@@ -1642,7 +1906,7 @@ class GPUDBNN:
 
     def _get_model_components_filename(self):
         """Get filename for model components"""
-        return os.path.join('Model', f'Best_{self.dataset_name}_components.pkl')
+        return os.path.join('Model', f'Best{modelType}_{self.dataset_name}_components.pkl')
 #----------------Handling categorical variables across sessions -------------------------
     def _save_categorical_encoders(self):
         """Save categorical feature encoders"""
@@ -1955,16 +2219,26 @@ def generate_test_datasets():
         f.write('1,1,0,1\n')
         f.write('1,1,1,0\n')
 
+
 def load_global_config():
     """Load global configuration parameters"""
     try:
+        # First read the file as text and clean comments
         with open("adaptive_dbnn.conf", 'r') as f:
-            config = json.load(f)
+            lines = []
+            for line in f:
+                # Remove everything after # in each line
+                clean_line = line.split('#')[0].strip()
+                if clean_line:  # Only keep non-empty lines
+                    lines.append(clean_line)
 
+        # Join the cleaned lines and parse as JSON
+        config_str = ''.join(lines)
+        config = json.loads(config_str)
         # Define globals
         global Trials, cardinality_threshold, cardinality_tolerance
-        global LearningRate, TrainingRandomSeed, Epochs, TestFraction
-        global Train, Train_only, Predict, Gen_Samples, EnableAdaptive,nokbd,Train_device
+        global LearningRate, TrainingRandomSeed, Epochs, TestFraction,Fresh
+        global Train, Train_only, Predict, Gen_Samples, EnableAdaptive,nokbd,Train_device,modelType
 
         # Load training parameters
         Trials = config['training_params']['trials']
@@ -1977,14 +2251,15 @@ def load_global_config():
         EnableAdaptive = config['training_params']['enable_adaptive']
         usekbd =config['training_params']['use_interactive_kbd']
         Train_device=config['training_params']['compute_device']
-
+        modelType=config['training_params']['modelType']
+        print(f"using model type: {modelType}")
         # Load execution flags
         Train = config['execution_flags']['train']
         Train_only = config['execution_flags']['train_only']
         Predict = config['execution_flags']['predict']
         Gen_Samples = config['execution_flags']['gen_samples']
         Fresh = config['execution_flags']['fresh_start']
-
+        print(f"The fresh training is set to {Fresh}")
         nokbd= not usekbd
         if Train_device=='auto':
             Train_device='cuda' if torch.cuda.is_available() else 'cpu'
@@ -2009,7 +2284,8 @@ def load_global_config():
         EnableAdaptive = True  # Default value
         nokbd = False
         Train_device='cuda' if torch.cuda.is_available() else 'cpu'
-        print("Using default values")
+        modelType='Gaussian'
+        print("Using default values. Default model assumes Gaussian distribution. You can also use Histogram as modelType for nonparametric distributions.")
         return False
 
 
@@ -2018,6 +2294,7 @@ def load_global_config():
 if __name__ == "__main__":
     # Load configuration before class definition
     fresh_start = load_global_config()
+
     if nokbd==False:
         print("Will attempt keyboard interaction...")
         if os.name == 'nt' or 'darwin' in os.uname()[0].lower():  # Windows or MacOS
@@ -2070,7 +2347,7 @@ if __name__ == "__main__":
 
     if Gen_Samples:
         generate_test_datasets()
-
+    print(f"fresh start is {fresh_start}")
     # Test datasets
     datasets_to_test = DatasetConfig.get_available_datasets()
     for dataset in datasets_to_test:
