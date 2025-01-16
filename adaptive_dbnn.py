@@ -272,6 +272,7 @@ class GPUDBNN:
 
         # Load configuration before potential cleanup
         self.config = DatasetConfig.load_config(self.dataset_name)
+        self.feature_bounds = None  # Store global min/max for each
 
         # Initialize other attributes
         self.device = Train_device
@@ -341,6 +342,22 @@ class GPUDBNN:
         self._load_best_weights()
         self._load_categorical_encoders()
 
+    def set_feature_bounds(self, dataset):
+        """Initialize global feature bounds from complete dataset"""
+        if self.feature_bounds is None:
+            self.feature_bounds = {}
+            numerical_columns = dataset.select_dtypes(include=['int64', 'float64']).columns
+
+            for feat_name in numerical_columns:
+                feat_data = dataset[feat_name]
+                min_val = feat_data.min()
+                max_val = feat_data.max()
+                padding = (max_val - min_val) * 0.01
+                self.feature_bounds[feat_name] = {
+                    'min': min_val - padding,
+                    'max': max_val + padding
+                }
+
     def _clean_existing_model(self):
         """Remove existing model files for a fresh start"""
         try:
@@ -398,7 +415,7 @@ class GPUDBNN:
         # Get initial data (using class members)
         X = self.data.drop(columns=[self.target_column])
         y = self.data[self.target_column]
-
+        self.set_feature_bounds(X)
         # Use existing label encoder
         y_encoded = self.label_encoder.fit_transform(y)
         unique_classes = np.unique(y_encoded)
@@ -2100,29 +2117,6 @@ def run_gpu_benchmark(dataset_name: str, model=None, batch_size: int = 32):
 
     history = model.adaptive_fit_predict(max_rounds=model.max_epochs, batch_size=batch_size)
     results = model.fit_predict(batch_size=batch_size)
-
-    plot_training_progress(results['error_rates'], dataset_name)
-    plot_confusion_matrix(
-        results['confusion_matrix'],
-        model.label_encoder.classes_,
-        dataset_name
-    )
-
-    print(f"\nClassification Report for {dataset_name}:")
-    print(results['classification_report'])
-
-    return model, results
-def run_benchmark(dataset_name: str):
-    """Run benchmark on specified dataset"""
-    print(f"\nRunning benchmark on {dataset_name} dataset...")
-
-    model = DBNN(
-        dataset_name=dataset_name,
-        learning_rate=0.01,
-        max_epochs=100
-    )
-
-    results = model.fit_predict()
 
     plot_training_progress(results['error_rates'], dataset_name)
     plot_confusion_matrix(
