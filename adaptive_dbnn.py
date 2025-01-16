@@ -1339,7 +1339,7 @@ class GPUDBNN:
                 self.best_error = error_rate
                 self.best_W = self.current_W.clone()
                 self._save_best_weights()
-                if improvement <=0:
+                if improvement <=0.001:
                     patience_counter += 1
                 else:
                     patience_counter = 0
