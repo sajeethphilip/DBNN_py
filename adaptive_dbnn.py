@@ -1,4 +1,5 @@
 import torch
+import time
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
@@ -407,6 +408,7 @@ class GPUDBNN:
         """
         Adaptive training strategy using saved predictions from fit_predict
         """
+
         if not EnableAdaptive:
             print("Adaptive learning is disabled. Using standard training.")
             return self.fit_predict(batch_size=batch_size)
@@ -475,7 +477,10 @@ class GPUDBNN:
 
             # Use existing fit_predict method with save path
             save_path = f"round_{round_num}_predictions.csv"
+            total_start = time.time()
             results = self.fit_predict(batch_size=batch_size, save_path=save_path)
+            total_end = time.time()
+            print(f"Total training time for round {round_num} is: {total_end - total_start:.2f} seconds")
             current_accuracy = results['test_accuracy']
 
             if not self.adaptive_learning:
@@ -1251,6 +1256,7 @@ class GPUDBNN:
             if self.keyboard_listener:
                 self.keyboard_listener.start()
         # Compute likelihood parameters
+
         if modelType=="Histogram":
 
             self.likelihood_params = self._compute_pairwise_likelihood_parallel(
@@ -1263,7 +1269,6 @@ class GPUDBNN:
         else:
             print(f"{modelType} is invalid. Please edit configuration file.")
         # Initialize weights if not loaded
-
         if self.current_W is None:
 
             n_pairs = len(self.feature_pairs)
@@ -1285,7 +1290,9 @@ class GPUDBNN:
              patience = 5
         else:
             patience = Trials  # Number of epochs to wait for improvement
+        print("Starting training round")
         for epoch in range(self.max_epochs):
+            Trstart_time = time.time()
             failed_cases = []
             n_errors = 0
 
@@ -1334,6 +1341,8 @@ class GPUDBNN:
                             self._load_model_components()
                             self._load_best_weights()
                             break
+            Trend_time = time.time()
+            print(f"Training time for epoch {epoch+1} is: {Trend_time - Trstart_time:.2f} seconds")
             print(f"Epoch {epoch + 1}: Error rate = {error_rate:.4f}")
             # Update best weights if improved
             if error_rate <= self.best_error:
