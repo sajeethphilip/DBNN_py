@@ -986,8 +986,8 @@ class GPUDBNN:
 
     def _update_priors_parallel(self, failed_cases: List[Tuple], batch_size: int = 32):
         """
-        Update priors in parallel for failed cases using vectorized operations
-        and optimized matrix multiplication with consistent device handling
+        Update priors in parallel for failed cases using vectorized operations.
+        For each failed case, updates only the weight of its true class.
 
         Args:
             failed_cases: List of (feature, true_class) tuples
@@ -995,53 +995,46 @@ class GPUDBNN:
         """
         n_failed = len(failed_cases)
         if n_failed == 0:
+            # Update consecutive success counter and adjust learning rate
+            self.consecutive_successes = getattr(self, 'consecutive_successes', 0) + 1
+            if self.consecutive_successes >= 3:
+                self.learning_rate = min(self.learning_rate * 2, 1.0)
+                self.consecutive_successes = 0
             return
 
-        # Process all cases at once instead of batching
+        # Reset consecutive successes and decrease learning rate on failure
+        self.consecutive_successes = 0
+        self.learning_rate = max(self.learning_rate / 2, 1e-6)
+
+        # Pre-allocate tensors on device
         features = torch.stack([case[0] for case in failed_cases]).to(self.device)
-        # Ensure true_classes is on the correct device from the start
         true_classes = torch.tensor([case[1] for case in failed_cases], device=self.device)
 
-        if modelType=="Histogram":
-
-            # Compute posteriors for all cases at once
-            posteriors = self._compute_batch_posterior(features)  # Shape: [n_failed, n_classes]
-        elif modelType=="Gaussian":
-
-            # Compute posteriors for all cases at once
-            posteriors = self._compute_batch_posterior_std(features)  # Shape: [n_failed, n_classes]
+        # Compute posteriors based on model type
+        if modelType == "Histogram":
+            posteriors = self._compute_batch_posterior(features)
+        elif modelType == "Gaussian":
+            posteriors = self._compute_batch_posterior_std(features)
         else:
-            print(f"{modelType} is invalid. Please edit configutation file")
-        n_classes = len(self.likelihood_params['classes'])
+            raise ValueError(f"{modelType} is invalid. Please edit configuration file")
 
-        # Create class range tensor directly on the correct device
-        class_range = torch.arange(n_classes, device=self.device)
-        # Ensure true_classes is on the same device when creating mask
-        true_classes = true_classes.to(self.device)  # Extra safety check
-        mask = (class_range.unsqueeze(0) != true_classes.unsqueeze(1))  # Shape: [n_failed, n_classes]
-
-        # Create range tensor directly on the correct device
+        # Get the posterior probability for true class and max probability of other classes
         batch_range = torch.arange(n_failed, device=self.device)
-        true_probs = posteriors[batch_range, true_classes]  # Shape: [n_failed]
-        max_other_probs = (posteriors * mask).max(dim=1)[0]  # Shape: [n_failed]
+        true_probs = posteriors[batch_range, true_classes]
 
-        # Compute adjustments vectorized with bounds
-        raw_adjustments = self.learning_rate * (1 - true_probs/max_other_probs)  # Shape: [n_failed]
-        adjustments = torch.clamp(raw_adjustments, -0.5, 0.5)
+        # Create mask to get max probability among non-true classes
+        mask = torch.ones_like(posteriors, dtype=torch.bool)
+        mask[batch_range, true_classes] = False
+        max_other_probs = posteriors.masked_fill(~mask, float('-inf')).max(dim=1)[0]
 
-        # Create zeros tensor directly on the correct device
-        class_adjustments = torch.zeros(n_classes, device=self.device)
-        for class_idx in range(n_classes):
-            # Ensure class_id is a tensor on the correct device if needed
-            class_id = self.likelihood_params['classes'][class_idx]
-            if isinstance(class_id, torch.Tensor):
-                class_id = class_id.to(self.device)
-            class_mask = (true_classes == class_id)
-            if class_mask.any():
-                class_adjustments[class_idx] = adjustments[class_mask].mean()
+        # Compute adjustments
+        adjustments = self.learning_rate * (1 - true_probs/max_other_probs)
 
-        # Apply updates to all weights simultaneously
-        self.current_W *= (1 + class_adjustments.unsqueeze(1))  # Broadcasting across features
+        # For each failed case, update only its true class weight
+        for i, class_id in enumerate(true_classes):
+            self.current_W[class_id] += adjustments[i]
+
+        # Ensure weights stay within valid range
         self.current_W.clamp_(1e-10, 10.0)
 #---------------------------------------------------------Save Last data -------------------------
     def save_last_split(self, train_indices: list, test_indices: list):
@@ -1232,6 +1225,7 @@ class GPUDBNN:
         test_accuracies=[]
         stop_training=False
         patience_counter = 0  # Initialize patience counter here
+        self.learning_rate=LearningRate
         # Start keyboard listener
         def on_press(key):
             nonlocal stop_training
@@ -1343,12 +1337,15 @@ class GPUDBNN:
                     patience_counter += 1
                 else:
                     patience_counter = 0
+                    self.learning_rate=LearningRate
+                print(f"Patience counter now reads {patience_counter}")
             else:
                 patience_counter += 1
             # Early stopping with patience
             if patience_counter >= patience:
                 print(f"No significant improvement for {patience} epochs. Early stopping.")
                 break
+
             if stop_training:
                 if not nokbd:
                     # Clean up keyboard resources
@@ -1794,32 +1791,6 @@ class GPUDBNN:
 
         return {c_id: posteriors[idx].item() for idx, c_id in enumerate(classes)}
 
-
-    def _update_priors(self, failed_cases, epsilon=1e-10):
-        """Update priors with numerical stability measures"""
-        W_updates = defaultdict(lambda: defaultdict(list))
-
-        for features, true_class, posteriors in failed_cases:
-            P1 = posteriors[true_class] + epsilon
-            P2 = max((p for c, p in posteriors.items() if c != true_class), default=epsilon)
-            P2 = P2 + epsilon
-
-            raw_adjustment = self.learning_rate * (1 - P1/P2)
-            adjustment = max(min(raw_adjustment, 0.5), -0.5)
-
-            for feature_pair in self.likelihood_pdfs[true_class].keys():
-                W_updates[true_class][feature_pair].append(adjustment)
-
-        for class_id in W_updates:
-            for feature_pair in W_updates[class_id]:
-                updates = W_updates[class_id][feature_pair]
-                avg_update = sum(updates) / len(updates)
-
-                current_w = self.current_W[class_id][feature_pair].item()
-                new_w = current_w * (1 + avg_update)
-                new_w = max(min(new_w, 10.0), epsilon)
-
-                self.current_W[class_id][feature_pair] = torch.tensor(new_w, dtype=torch.float32)
 
 
     def fit_predict(self, batch_size: int = 32, save_path: str = None):
