@@ -406,8 +406,7 @@ class GPUDBNN:
                         load_epoch: int = None,
                         batch_size: int = 32):
         """
-        Adaptive training strategy without using test_fraction.
-        Uses entire dataset minus training examples for testing.
+        Adaptive training strategy with proper continuation from last state.
         """
         if not EnableAdaptive:
             print("Adaptive learning is disabled. Using standard training.")
@@ -415,7 +414,7 @@ class GPUDBNN:
 
         self.in_adaptive_fit = True
 
-        # Get initial data (using class members)
+        # Get initial data
         X = self.data.drop(columns=[self.target_column])
         y = self.data[self.target_column]
         self.set_feature_bounds(X)
@@ -425,22 +424,32 @@ class GPUDBNN:
         unique_classes = np.unique(y_encoded)
         original_classes = self.label_encoder.inverse_transform(unique_classes)
 
-        # Try to load last training epoch first
-        last_epoch_file = os.path.join(self.base_save_path, f'{self.dataset_name}_last_epoch.txt')
-        if os.path.exists(last_epoch_file) and not self.fresh_start:
-            with open(last_epoch_file, 'r') as f:
-                last_epoch = int(f.read().strip())
-            train_indices, test_indices = self.load_epoch_data(last_epoch)
-            start_round = last_epoch + 1
-            max_rounds = max_rounds + start_round
-            print(f"Continuing from epoch {last_epoch}")
+        # Try to load last training state
+        train_indices = None
+        test_indices = None
+        start_round = 0
 
-            if load_epoch is not None:
-                train_indices, test_indices = self.load_epoch_data(load_epoch)
-                start_round = load_epoch + 1
-                print(f"Loading data from epoch {load_epoch}")
-        else:
-            # Initialize with one example per class
+        if not self.fresh_start:
+            # First try to load the last known split
+            train_indices, test_indices = self.load_last_known_split()
+
+            if train_indices is not None:
+                print("Loaded last known training/testing split")
+                start_round = 1  # Start from next round
+            else:
+                # Try loading from last epoch file
+                last_epoch_file = os.path.join(self.base_save_path, f'{self.dataset_name}_last_epoch.txt')
+                if os.path.exists(last_epoch_file):
+                    with open(last_epoch_file, 'r') as f:
+                        last_epoch = int(f.read().strip())
+                    train_indices, test_indices = self.load_epoch_data(last_epoch)
+                    if train_indices is not None:
+                        start_round = last_epoch + 1
+                        print(f"Continuing from epoch {last_epoch}")
+
+        # If no previous state found or fresh start, initialize new training
+        if train_indices is None:
+            print("Initializing new training state")
             train_indices = []
             class_indices = defaultdict(list)
 
@@ -457,6 +466,7 @@ class GPUDBNN:
             test_indices = list(all_indices - set(train_indices))
             start_round = 0
 
+        max_rounds = max_rounds + start_round
         history = {
             'round': [],
             'train_size': [],
@@ -477,14 +487,14 @@ class GPUDBNN:
             train_mask = torch.zeros(len(X), dtype=torch.bool, device=self.device)
             train_mask[train_indices] = True
 
-            # Create test data from ALL remaining examples
+            # Use remaining data for testing
             test_mask = torch.zeros(len(X), dtype=torch.bool, device=self.device)
             test_mask[test_indices] = True
 
             # Save current epoch data
             self.save_epoch_data(round_num, train_indices, test_indices)
 
-            # Use existing fit_predict method with save path
+            # Train and predict
             save_path = f"round_{round_num}_predictions.csv"
             total_start = time.time()
             results = self.fit_predict(batch_size=batch_size, save_path=save_path)
@@ -496,22 +506,19 @@ class GPUDBNN:
                 print("Adaptive learning disabled. Training with current data only.")
                 break
 
-            # Read predictions and probabilities from saved file
+            # Process predictions
             predictions_df = pd.read_csv(save_path)
-
-            # Filter predictions to only include test set
             test_predictions_df = predictions_df[predictions_df.index.isin(test_indices)]
-
             predictions = test_predictions_df['predicted_class'].values
             true_labels = test_predictions_df['true_class'].values
 
-            # Get probability columns using original class labels
+            # Get probability columns
             prob_columns = [f'prob_{class_label}' for class_label in original_classes]
             probabilities = test_predictions_df[prob_columns].values
 
             # Find misclassified examples in test set
             misclassified_mask = (predictions != true_labels)
-            misclassified_indices = test_predictions_df.index[misclassified_mask].tolist()
+            misclassified_indices = np.where(misclassified_mask)[0]
 
             # Save the last epoch number
             with open(last_epoch_file, 'w') as f:
@@ -524,43 +531,33 @@ class GPUDBNN:
             history['accuracy'].append(current_accuracy)
             history['misclassified'].append(len(misclassified_indices))
 
-            print(f"Current accuracy: {current_accuracy:.4f}")
-            print(f"Misclassified examples: {len(misclassified_indices)}")
+            print(f"Current accuracy on remaining data: {current_accuracy:.4f}")
+            print(f"Misclassified examples in remaining data: {len(misclassified_indices)}")
 
-            # Check improvement
-            if current_accuracy > best_accuracy + improvement_threshold:
-                best_accuracy = current_accuracy
-                rounds_without_improvement = 0
-            else:
-                rounds_without_improvement += 1
-                if rounds_without_improvement >= 3:
-                    print("No improvement for 3 rounds. Stopping early.")
-                    break
-
+            # Check if we have 100% accuracy on remaining data
             if len(misclassified_indices) == 0:
-                print("All examples correctly classified. Stopping.")
+                print("Achieved 100% accuracy on remaining data. Stopping.")
                 break
 
-            # Select both highest and lowest confidence misclassifications
+            # Select both most confident and least confident misclassifications
             new_train_indices = []
             for class_idx, class_label in enumerate(unique_classes):
                 # Find misclassified examples predicted as this class
                 class_mask = (predictions == class_label) & misclassified_mask
                 if np.any(class_mask):
-                    # Get probabilities for predicted class
+                    # Get probabilities for predicted class using original class label
                     original_class = original_classes[class_idx]
                     prob_col = f'prob_{original_class}'
                     class_probs = test_predictions_df[prob_col].values[class_mask]
-                    mask_indices = np.where(class_mask)[0]
 
-                    # Add both highest and lowest confidence errors
+                    # Get indices of both max and min probability cases
+                    mask_indices = np.where(class_mask)[0]
                     if len(class_probs) > 0:
                         max_prob_idx = mask_indices[np.argmax(class_probs)]
                         min_prob_idx = mask_indices[np.argmin(class_probs)]
-                        new_train_indices.extend([
-                            test_indices[max_prob_idx],
-                            test_indices[min_prob_idx]
-                        ])
+                        max_original_idx = test_indices[max_prob_idx]
+                        min_original_idx = test_indices[min_prob_idx]
+                        new_train_indices.extend([max_original_idx, min_original_idx])
 
             # Update train and test sets
             train_indices.extend(new_train_indices)
@@ -571,14 +568,13 @@ class GPUDBNN:
             if os.path.exists(save_path):
                 os.remove(save_path)
 
-        # Save final history and split
+        # Save final history
         with open(os.path.join(self.base_save_path, f'{modelType}_training_history.json'), 'w') as f:
             json.dump(history, f)
 
         self.save_last_split(train_indices, test_indices)
         self.in_adaptive_fit = False
         return history
-
 
     #------------------------------------------Adaptive Learning--------------------------------------
     def _calculate_cardinality_threshold(self):
