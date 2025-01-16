@@ -402,23 +402,24 @@ class GPUDBNN:
         return train_indices, test_indices
 
     def adaptive_fit_predict(self, max_rounds: int = 10,
-                            improvement_threshold: float = 0.001,
-                            load_epoch: int = None,
-                            batch_size: int = 32):
+                        improvement_threshold: float = 0.001,
+                        load_epoch: int = None,
+                        batch_size: int = 32):
         """
-        Adaptive training strategy using saved predictions from fit_predict.
-        Only tests on unused data to avoid bias in selecting new training examples.
+        Adaptive training strategy without using test_fraction.
+        Uses entire dataset minus training examples for testing.
         """
-
         if not EnableAdaptive:
             print("Adaptive learning is disabled. Using standard training.")
             return self.fit_predict(batch_size=batch_size)
 
         self.in_adaptive_fit = True
+
         # Get initial data (using class members)
         X = self.data.drop(columns=[self.target_column])
         y = self.data[self.target_column]
         self.set_feature_bounds(X)
+
         # Use existing label encoder
         y_encoded = self.label_encoder.fit_transform(y)
         unique_classes = np.unique(y_encoded)
@@ -433,7 +434,7 @@ class GPUDBNN:
             start_round = last_epoch + 1
             max_rounds = max_rounds + start_round
             print(f"Continuing from epoch {last_epoch}")
-            # Then try specified epoch
+
             if load_epoch is not None:
                 train_indices, test_indices = self.load_epoch_data(load_epoch)
                 start_round = load_epoch + 1
@@ -451,7 +452,7 @@ class GPUDBNN:
             for class_label in unique_classes:
                 train_indices.append(class_indices[class_label][0])
 
-            # Initialize test_indices with all remaining indices
+            # Initialize test_indices with ALL remaining indices
             all_indices = set(range(len(X)))
             test_indices = list(all_indices - set(train_indices))
             start_round = 0
@@ -472,11 +473,11 @@ class GPUDBNN:
             print(f"Training set size: {len(train_indices)}")
             print(f"Test set size: {len(test_indices)}")
 
-            # Create masks only for current train/test split
+            # Create masks for current train/test split
             train_mask = torch.zeros(len(X), dtype=torch.bool, device=self.device)
             train_mask[train_indices] = True
 
-            # Create test data only from unused examples
+            # Create test data from ALL remaining examples
             test_mask = torch.zeros(len(X), dtype=torch.bool, device=self.device)
             test_mask[test_indices] = True
 
@@ -510,7 +511,7 @@ class GPUDBNN:
 
             # Find misclassified examples in test set
             misclassified_mask = (predictions != true_labels)
-            misclassified_indices = np.where(misclassified_mask)[0]
+            misclassified_indices = test_predictions_df.index[misclassified_mask].tolist()
 
             # Save the last epoch number
             with open(last_epoch_file, 'w') as f:
@@ -540,42 +541,40 @@ class GPUDBNN:
                 print("All examples correctly classified. Stopping.")
                 break
 
-            # Select both most confident and least confident misclassifications
+            # Select both highest and lowest confidence misclassifications
             new_train_indices = []
             for class_idx, class_label in enumerate(unique_classes):
                 # Find misclassified examples predicted as this class
                 class_mask = (predictions == class_label) & misclassified_mask
                 if np.any(class_mask):
-                    # Get probabilities for predicted class using original class label
+                    # Get probabilities for predicted class
                     original_class = original_classes[class_idx]
                     prob_col = f'prob_{original_class}'
                     class_probs = test_predictions_df[prob_col].values[class_mask]
-
-                    # Get indices of both max and min probability cases
-                    max_prob_idx = np.argmax(class_probs)
-                    min_prob_idx = np.argmin(class_probs)
-
-                    # Map back to original dataset indices using test_indices
                     mask_indices = np.where(class_mask)[0]
-                    max_original_idx = test_indices[mask_indices[max_prob_idx]]
-                    min_original_idx = test_indices[mask_indices[min_prob_idx]]
 
-                    # Add both indices to new training set
-                    new_train_indices.extend([max_original_idx, min_original_idx])
+                    # Add both highest and lowest confidence errors
+                    if len(class_probs) > 0:
+                        max_prob_idx = mask_indices[np.argmax(class_probs)]
+                        min_prob_idx = mask_indices[np.argmin(class_probs)]
+                        new_train_indices.extend([
+                            test_indices[max_prob_idx],
+                            test_indices[min_prob_idx]
+                        ])
 
             # Update train and test sets
             train_indices.extend(new_train_indices)
             # Remove newly added training examples from test set
             test_indices = list(set(test_indices) - set(new_train_indices))
 
-            # Clean up prediction file if needed
+            # Clean up prediction file
             if os.path.exists(save_path):
                 os.remove(save_path)
 
-        # Save final history
+        # Save final history and split
         with open(os.path.join(self.base_save_path, f'{modelType}_training_history.json'), 'w') as f:
             json.dump(history, f)
-        # Save final training/testing split
+
         self.save_last_split(train_indices, test_indices)
         self.in_adaptive_fit = False
         return history
@@ -986,8 +985,8 @@ class GPUDBNN:
 
     def _update_priors_parallel(self, failed_cases: List[Tuple], batch_size: int = 32):
         """
-        Update priors in parallel for failed cases using vectorized operations.
-        For each failed case, updates only the weight of its true class.
+        Update priors for failed cases, maintaining individual example weights.
+        Only adds adjustments without upper limits.
 
         Args:
             failed_cases: List of (feature, true_class) tuples
@@ -995,7 +994,6 @@ class GPUDBNN:
         """
         n_failed = len(failed_cases)
         if n_failed == 0:
-            # Update consecutive success counter and adjust learning rate
             self.consecutive_successes = getattr(self, 'consecutive_successes', 0) + 1
             if self.consecutive_successes >= 3:
                 self.learning_rate = min(self.learning_rate * 2, 1.0)
@@ -1027,15 +1025,16 @@ class GPUDBNN:
         mask[batch_range, true_classes] = False
         max_other_probs = posteriors.masked_fill(~mask, float('-inf')).max(dim=1)[0]
 
-        # Compute adjustments
+        # Compute adjustments (only positive additions)
         adjustments = self.learning_rate * (1 - true_probs/max_other_probs)
 
-        # For each failed case, update only its true class weight
+        # For each failed case, update its weight by adding the adjustment
+        # No upper limit imposed on weights
         for i, class_id in enumerate(true_classes):
             self.current_W[class_id] += adjustments[i]
 
-        # Ensure weights stay within valid range
-        self.current_W.clamp_(1e-10, 10.0)
+        # Ensure weights stay above minimum threshold
+        self.current_W.clamp_(min=1e-10)
 #---------------------------------------------------------Save Last data -------------------------
     def save_last_split(self, train_indices: list, test_indices: list):
         """Save the last training/testing split to CSV files"""
