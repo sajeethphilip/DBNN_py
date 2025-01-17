@@ -266,7 +266,8 @@ class GPUDBNN:
         test_size: float = TestFraction,
         random_state: int = TrainingRandomSeed,
         device: str = None,
-        fresh: bool = False
+        fresh: bool = False,
+        use_previous_model: bool = True
     ):
         # Set dataset_name first
         self.dataset_name = dataset_name.lower()
@@ -289,10 +290,38 @@ class GPUDBNN:
         #self.compute_dtype = torch.float64  # Use double precision for computations
         self.cardinality_tolerance = cardinality_tolerance  # Only for feature grouping
         self.fresh_start = fresh
-        # Handle fresh start after configuration is loaded
-        if fresh:
-            self._clean_existing_model()
+        self.use_previous_model = use_previous_model
+        # Create Model directory
+        os.makedirs('Model', exist_ok=True)
 
+        # Load configuration and data
+        self.config = DatasetConfig.load_config(self.dataset_name)
+        self.data = self._load_dataset()
+        self.target_column = self.config['target_column']
+
+        # Initialize model components
+        self.scaler = StandardScaler()
+        self.label_encoder = LabelEncoder()
+        self.likelihood_params = None
+        self.feature_pairs = None
+        self.best_W = None
+        self.best_error = float('inf')
+        self.current_W = None
+
+        # Handle fresh start after configuration is loaded
+        # Handle model state based on flags
+        if not fresh and use_previous_model:
+            # Load previous model state
+            self._load_model_components()
+            self._load_best_weights()
+            self._load_categorical_encoders()
+        elif fresh and use_previous_model:
+            # Use previous model weights but start with fresh data
+            self._load_best_weights()
+            self._load_categorical_encoders()
+        else:
+            # Complete fresh start
+            self._clean_existing_model()
 
 
         #------------------------------------------Adaptive Learning--------------------------------------
@@ -406,7 +435,7 @@ class GPUDBNN:
                         load_epoch: int = None,
                         batch_size: int = 32):
         """
-        Adaptive training strategy with proper continuation from last state.
+        Adaptive training strategy with proper variable scope handling.
         """
         if not EnableAdaptive:
             print("Adaptive learning is disabled. Using standard training.")
@@ -424,32 +453,33 @@ class GPUDBNN:
         unique_classes = np.unique(y_encoded)
         original_classes = self.label_encoder.inverse_transform(unique_classes)
 
+        # Define last_epoch_file at the proper scope
+        last_epoch_file = os.path.join(self.base_save_path, f'{self.dataset_name}_last_epoch.txt')
+
         # Try to load last training state
         train_indices = None
         test_indices = None
         start_round = 0
 
         if not self.fresh_start:
-            # First try to load the last known split
+            # Load last known good split
             train_indices, test_indices = self.load_last_known_split()
-
             if train_indices is not None:
-                print("Loaded last known training/testing split")
-                start_round = 1  # Start from next round
+                print("Continuing with previous training/testing split")
+                if os.path.exists(os.path.join(self.base_save_path, f'{self.dataset_name}_last_epoch.txt')):
+                    with open(os.path.join(self.base_save_path, f'{self.dataset_name}_last_epoch.txt'), 'r') as f:
+                        start_round = int(f.read().strip()) + 1
+                print(f"Continuing from round {start_round}")
+        else:
+            if not self.use_previous_model:
+                print("Starting fresh training with new model")
+                self._clean_existing_model()
             else:
-                # Try loading from last epoch file
-                last_epoch_file = os.path.join(self.base_save_path, f'{self.dataset_name}_last_epoch.txt')
-                if os.path.exists(last_epoch_file):
-                    with open(last_epoch_file, 'r') as f:
-                        last_epoch = int(f.read().strip())
-                    train_indices, test_indices = self.load_epoch_data(last_epoch)
-                    if train_indices is not None:
-                        start_round = last_epoch + 1
-                        print(f"Continuing from epoch {last_epoch}")
+                print("Starting fresh training with previous model weights")
 
-        # If no previous state found or fresh start, initialize new training
+        # Initialize new training if needed
         if train_indices is None:
-            print("Initializing new training state")
+            print("Initializing new training data split")
             train_indices = []
             class_indices = defaultdict(list)
 
@@ -464,6 +494,7 @@ class GPUDBNN:
             # Initialize test_indices with ALL remaining indices
             all_indices = set(range(len(X)))
             test_indices = list(all_indices - set(train_indices))
+
             start_round = 0
 
         max_rounds = max_rounds + start_round
@@ -561,7 +592,6 @@ class GPUDBNN:
 
             # Update train and test sets
             train_indices.extend(new_train_indices)
-            # Remove newly added training examples from test set
             test_indices = list(set(test_indices) - set(new_train_indices))
 
             # Clean up prediction file
