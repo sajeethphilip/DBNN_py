@@ -12,6 +12,23 @@ Press the "q" or "Q" key during training to interrupt training and go to the nex
 
 The older version of the C++ code used space as the separator, which is not ideal. space2csv.py function can convert the file into CSV.
 Let me break down the key components of this GPU-optimized Deep Bayesian Neural Network (DBNN) implementation.
+## Sample configuration file for data
+{
+    "file_path": "cardiotocography.csv",
+    "target_column": "NSP",
+    "separator": ",",
+    "has_header": true,
+    "likelihood_config": {
+        "feature_group_size": 2,
+        "max_combinations": 1000,
+        "bin_sizes": [64],  # Use 64 bins uniformly
+        # or use variable bins:
+        # "bin_sizes": [3, 7, 13, 21],
+        "boosting_enabled": true,
+        "boosting_factor": 1.5
+    }
+}
+
 
 ## Core Components
 
