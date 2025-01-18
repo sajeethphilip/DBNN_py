@@ -6,6 +6,8 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.metrics import classification_report, confusion_matrix
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import seaborn as sns
 from typing import Dict, Tuple, Any, List, Union
@@ -24,6 +26,7 @@ import torch
 import os
 import pickle
 import configparser
+import traceback  # Add to provide debug
 #------------------------------------------------------------------------Declarations---------------------
 Trials = 100  # Number of epochs to wait for improvement in training
 cardinality_threshold =0.9
@@ -43,165 +46,208 @@ display = None  # Initialize display variable
 #----------------------------------------------------------------------------------------------------------------
 
 class DatasetConfig:
-    """Handle dataset configuration loading and validation"""
+    """Enhanced dataset configuration handling with support for column names and URLs"""
 
     DEFAULT_CONFIG = {
+        "file_path": None,
+        "column_names": None,  # Added support for column names
+        "target_column": "target",
+        "separator": ",",
+        "has_header": True,
         "likelihood_config": {
             "feature_group_size": 2,
-            "max_combinations": 1000
+            "max_combinations": 1000,
+            "bin_sizes": [20]
         }
     }
 
     @staticmethod
-    def _get_user_input(prompt: str, default_value: Any = None, validation_fn: callable = None) -> Any:
-        """Helper method to get validated user input"""
-        while True:
-            if default_value is not None:
-                user_input = input(f"{prompt} (default: {default_value}): ").strip()
-                if not user_input:
-                    return default_value
-            else:
-                user_input = input(f"{prompt}: ").strip()
-
-            if validation_fn:
-                try:
-                    validated_value = validation_fn(user_input)
-                    return validated_value
-                except ValueError as e:
-                    print(f"Invalid input: {e}")
-            else:
-                return user_input
+    def is_url(path: str) -> bool:
+        """Check if the given path is a URL"""
+        return path.startswith(('http://', 'https://'))
 
     @staticmethod
-    def _validate_boolean(value: str) -> bool:
-        """Validate and convert string to boolean"""
-        value = value.lower()
-        if value in ('true', 't', 'yes', 'y', '1'):
-            return True
-        elif value in ('false', 'f', 'no', 'n', '0'):
+    def validate_url(url: str) -> bool:
+        """Validate that a URL is accessible"""
+        try:
+            response = requests.head(url)
+            return response.status_code == 200
+        except:
             return False
-        raise ValueError("Please enter 'yes' or 'no'")
 
     @staticmethod
-    def _validate_int(value: str) -> int:
-        """Validate and convert string to integer"""
-        try:
-            return int(value)
-        except ValueError:
-            raise ValueError("Please enter a valid integer")
+    def validate_columns(config: Dict) -> bool:
+        """Validate column configuration"""
+        if 'column_names' in config and config['column_names']:
+            if not isinstance(config['column_names'], list):
+                print("Error: column_names must be a list")
+                return False
+
+            # Validate target column is in column names
+            if config['target_column'] not in config['column_names']:
+                print(f"Error: target_column '{config['target_column']}' not found in column_names")
+                return False
+
+        return True
 
     @staticmethod
-    def _prompt_for_config(dataset_name: str) -> Dict:
-        """Prompt user for configuration parameters"""
-        print(f"\nConfiguration file for {dataset_name} not found or invalid.")
-        print("Please provide the following configuration parameters:\n")
+    def create_default_config(dataset_name: str) -> Dict:
+        """Create a default configuration file with enhanced defaults"""
+        config = DatasetConfig.DEFAULT_CONFIG.copy()
+        config['file_path'] = f"{dataset_name}.csv"
 
-        config = {}
+        # Try to infer column names from CSV if it exists
+        if os.path.exists(config['file_path']):
+            try:
+                with open(config['file_path'], 'r') as f:
+                    header = f.readline().strip()
+                    config['column_names'] = header.split(config['separator'])
+                    if config['column_names']:
+                        config['target_column'] = config['column_names'][-1]
+            except:
+                pass
 
-        # Get file path
-        config['file_path'] = DatasetConfig._get_user_input(
-            "Enter the path to your CSV file",
-            f"{dataset_name}.csv"
-        )
+        config_path = f"{dataset_name}.conf"
+        with open(config_path, 'w') as f:
+            json.dump(config, f, indent=4)
 
-        # Get target column
-        target_column = DatasetConfig._get_user_input(
-            "Enter the name or index of the target column",
-            "target"
-        )
-        # Convert to integer if possible
-        try:
-            config['target_column'] = int(target_column)
-        except ValueError:
-            config['target_column'] = target_column
-
-        # Get separator
-        config['separator'] = DatasetConfig._get_user_input(
-            "Enter the CSV separator character",
-            ","
-        )
-
-        # Get header information
-        config['has_header'] = DatasetConfig._get_user_input(
-            "Does the file have a header row? (yes/no)",
-            "yes",
-            DatasetConfig._validate_boolean
-        )
-
-        # Get likelihood configuration
-        print("\nLikelihood Configuration:")
-        config['likelihood_config'] = {
-            'feature_group_size': DatasetConfig._get_user_input(
-                "Enter the feature group size",
-                2,
-                DatasetConfig._validate_int
-            ),
-            'max_combinations': DatasetConfig._get_user_input(
-                "Enter the maximum number of feature combinations",
-                1000,
-                DatasetConfig._validate_int
-            )
-        }
-
+        print(f"Created default configuration file: {config_path}")
         return config
 
     @staticmethod
     def load_config(dataset_name: str) -> Dict:
-        """Load configuration from file, ignoring comments starting with #"""
+        """Enhanced configuration loading with support for URLs and column names"""
         config_path = f"{dataset_name}.conf"
 
         try:
-            if os.path.exists(config_path):
-                # Read existing configuration
-                with open(config_path, 'r') as f:
-                    # Skip lines starting with # and join remaining lines
-                    config_str = ''.join(line for line in f if not line.strip().startswith('#'))
+            # Check if configuration file exists
+            if not os.path.exists(config_path):
+                print(f"Configuration file {config_path} not found.")
+                return DatasetConfig.create_default_config(dataset_name)
 
-                    try:
-                        config = json.load(StringIO(config_str))
-                    except json.JSONDecodeError:
-                        print(f"Error reading configuration file: {config_path}")
-                        config = DatasetConfig._prompt_for_config(dataset_name)
+            # Read existing configuration
+            with open(config_path, 'r') as f:
+                # Handle comments and empty lines
+                config_lines = []
+                for line in f:
+                    # Remove inline comments
+                    line = line.split('#')[0].strip()
+                    if line:
+                        config_lines.append(line)
+
+                config_str = ''.join(config_lines)
+
+                try:
+                    config = json.loads(config_str)
+                except json.JSONDecodeError as e:
+                    print(f"Error parsing {config_path}: {str(e)}")
+                    return DatasetConfig.create_default_config(dataset_name)
+
+            # Validate and update configuration with defaults
+            validated_config = DatasetConfig.DEFAULT_CONFIG.copy()
+            validated_config.update(config)
+
+            # Validate file path
+            if DatasetConfig.is_url(validated_config['file_path']):
+                if not DatasetConfig.validate_url(validated_config['file_path']):
+                    print(f"Warning: URL {validated_config['file_path']} is not accessible")
+
+            # Validate column configuration
+            if not DatasetConfig.validate_columns(validated_config):
+                print("Warning: Invalid column configuration")
+                if 'column_names' in validated_config:
+                    del validated_config['column_names']
+
+            # Ensure likelihood_config has all required fields
+            if 'likelihood_config' not in validated_config:
+                validated_config['likelihood_config'] = DatasetConfig.DEFAULT_CONFIG['likelihood_config']
             else:
-                config = DatasetConfig._prompt_for_config(dataset_name)
-
-            # Validate and ensure all required fields exist
-            required_fields = ['file_path', 'target_column', 'separator', 'has_header']
-            missing_fields = [field for field in required_fields if field not in config]
-
-            if missing_fields:
-                print(f"Missing required fields: {missing_fields}")
-                config = DatasetConfig._prompt_for_config(dataset_name)
-
-            # Ensure likelihood_config exists with defaults
-            if 'likelihood_config' not in config:
-                config['likelihood_config'] = DatasetConfig.DEFAULT_CONFIG['likelihood_config']
-            else:
-                # Ensure all likelihood_config fields exist
                 default_likelihood = DatasetConfig.DEFAULT_CONFIG['likelihood_config']
-                for key, default_value in default_likelihood.items():
-                    if key not in config['likelihood_config']:
-                        config['likelihood_config'][key] = default_value
+                validated_config['likelihood_config'].update(
+                    {k: v for k, v in default_likelihood.items()
+                     if k not in validated_config['likelihood_config']}
+                )
 
-            # Save the configuration
+            # Validate bin_sizes
+            bin_sizes = validated_config['likelihood_config'].get('bin_sizes', [20])
+            if not isinstance(bin_sizes, list):
+                bin_sizes = [bin_sizes]
+            validated_config['likelihood_config']['bin_sizes'] = bin_sizes
+
+            # Save validated configuration
             with open(config_path, 'w') as f:
-                json.dump(config, f, indent=4)
-                print(f"\nConfiguration saved to: {config_path}")
+                json.dump(validated_config, f, indent=4)
 
-            return config
+            return validated_config
 
         except Exception as e:
             print(f"Error handling configuration: {str(e)}")
-            return DatasetConfig._prompt_for_config(dataset_name)
+            return DatasetConfig.create_default_config(dataset_name)
+
+    @staticmethod
+    def download_dataset(url: str, local_path: str) -> bool:
+        """Download dataset from URL to local path"""
+        try:
+            response = requests.get(url)
+            response.raise_for_status()
+            with open(local_path, 'w') as f:
+                f.write(response.text)
+            return True
+        except Exception as e:
+            print(f"Error downloading dataset: {str(e)}")
+            return False
 
     @staticmethod
     def get_available_datasets() -> List[str]:
         """Get list of available dataset configurations"""
-        # Look for .conf files in the current directory, excluding adaptive_dbnn.conf
-        return [f.split('.')[0] for f in os.listdir()
-                if f.endswith('.conf')
-                and f != 'adaptive_dbnn.conf'
-                and os.path.isfile(f)]
+        conf_files = {f.split('.')[0] for f in os.listdir()
+                     if f.endswith('.conf') and f != 'adaptive_dbnn.conf'}
+        csv_files = {f.split('.')[0] for f in os.listdir()
+                    if f.endswith('.csv')}
+
+        datasets = conf_files.union(csv_files)
+        return sorted(list(datasets))
+
+    @staticmethod
+    def validate_dataset(dataset_name: str) -> bool:
+        """Validate dataset existence and accessibility"""
+        config = DatasetConfig.load_config(dataset_name)
+        file_path = config['file_path']
+
+        # Handle URL-based datasets
+        if DatasetConfig.is_url(file_path):
+            if not DatasetConfig.validate_url(file_path):
+                print(f"Warning: Dataset URL {file_path} is not accessible")
+                return False
+
+            # Download to local cache if needed
+            local_path = f"{dataset_name}.csv"
+            if not os.path.exists(local_path):
+                if not DatasetConfig.download_dataset(file_path, local_path):
+                    return False
+            file_path = local_path
+
+        if not os.path.exists(file_path):
+            print(f"Warning: Dataset file {file_path} not found")
+            return False
+
+        try:
+            # Validate CSV structure
+            with open(file_path, 'r') as f:
+                header = f.readline()
+                first_line = f.readline()
+
+                if config.get('column_names'):
+                    if config['has_header']:
+                        header_cols = header.strip().split(config['separator'])
+                        if len(header_cols) != len(config['column_names']):
+                            print(f"Warning: Number of columns in file ({len(header_cols)}) "
+                                 f"doesn't match configuration ({len(config['column_names'])})")
+
+            return True
+        except Exception as e:
+            print(f"Error validating dataset {dataset_name}: {str(e)}")
+            return False
 
 #---------------------------------------Feature Filter with a #------------------------------------
 def _filter_features_from_config(df: pd.DataFrame, config: Dict) -> pd.DataFrame:
@@ -252,32 +298,367 @@ def _filter_features_from_config(df: pd.DataFrame, config: Dict) -> pd.DataFrame
         print(f"Dropped commented features: {cols_to_drop}")
 
     return df
+#-------------------------------------------------
+class ComputationCache:
+    """Cache for frequently used computations"""
+    def __init__(self, device):
+        self.device = device
+        self.bin_edges_cache = {}
+        self.bin_indices_cache = {}
+        self.feature_group_cache = {}
+        self.max_cache_size = 1000
 
+    def get_bin_edges(self, group_idx, edges):
+        if group_idx not in self.bin_edges_cache:
+            self.bin_edges_cache[group_idx] = torch.stack([
+                edge.contiguous() for edge in edges
+            ]).to(self.device)
+        return self.bin_edges_cache[group_idx]
+
+    def get_feature_group(self, features, group_idx, feature_pairs):
+        key = (features.shape[0], group_idx)
+        if key not in self.feature_group_cache:
+            if len(self.feature_group_cache) >= self.max_cache_size:
+                self.feature_group_cache.clear()
+            self.feature_group_cache[key] = features[:, feature_pairs[group_idx]].contiguous()
+        return self.feature_group_cache[key]
+
+class BinWeightUpdater:
+    def __init__(self, n_classes, feature_pairs, n_bins_per_dim=5):
+        self.n_classes = n_classes
+        self.feature_pairs = feature_pairs
+        self.n_bins_per_dim = n_bins_per_dim
+        self.device=Train_device
+        # Initialize histogram_weights as empty dictionary first
+        self.histogram_weights = {}
+
+        # Create weights for each class and feature pair
+        for class_id in range(n_classes):
+            self.histogram_weights[class_id] = {}
+            for pair_idx in range(len(feature_pairs)):
+                # Initialize with default weight of 0.1
+                #print(f"[DEBUG] Creating weights for class {class_id}, pair {pair_idx}")
+                self.histogram_weights[class_id][pair_idx] = torch.full(
+                    (n_bins_per_dim, n_bins_per_dim),
+                    0.1,
+                    dtype=torch.float32,
+                    device=self.device  # Ensure weights are created on correct device
+                ).contiguous()
+
+        # Initialize weights for each class and feature pair
+        self.gaussian_weights = {}
+        for class_id in range(n_classes):
+            self.gaussian_weights[class_id] = {}
+            for pair_idx in range(len(feature_pairs)):
+                # Initialize with default weight of 0.1
+                self.gaussian_weights[class_id][pair_idx] = torch.tensor(0.1,
+                    dtype=torch.float32,
+                    device=self.device
+                ).contiguous()
+
+        # Verify initialization
+        print(f"[DEBUG] Weight initialization complete. Structure:")
+        print(f"- Number of classes: {len(self.histogram_weights)}")
+        for class_id in self.histogram_weights:
+            print(f"- Class {class_id}: {len(self.histogram_weights[class_id])} feature pairs")
+
+        # Use a single contiguous tensor for all weights
+        self.weights = torch.full(
+            (n_classes, len(feature_pairs), n_bins_per_dim, n_bins_per_dim),
+            0.1,
+            dtype=torch.float32,
+            device=self.device  # Ensure weights are created on correct device
+        ).contiguous()
+
+        # Pre-allocate update buffers
+        self.update_indices = torch.zeros((3, 1000), dtype=torch.long)  # [dim, max_updates]
+        self.update_values = torch.zeros(1000, dtype=torch.float32)
+        self.update_count = 0
+
+
+    def batch_update_weights(self, class_indices, pair_indices, bin_indices, adjustments):
+            """Batch update with compatibility and proper shape handling"""
+            n_updates = len(class_indices)
+
+            # Process in batches for memory efficiency
+            batch_size = 100  # Adjust based on available memory
+            for i in range(0, n_updates, batch_size):
+                end_idx = min(i + batch_size, n_updates)
+
+                for idx in range(i, end_idx):
+                    class_id = int(class_indices[idx])
+                    pair_idx = int(pair_indices[idx])
+
+                    # Handle bin indices properly based on their structure
+                    if isinstance(bin_indices[idx], tuple):
+                        bin_i, bin_j = bin_indices[idx]
+                    else:
+                        # If bin_indices is a tensor or array
+                        bin_i = bin_indices[idx][0] if len(bin_indices[idx].shape) > 1 else bin_indices[idx]
+                        bin_j = bin_indices[idx][1] if len(bin_indices[idx].shape) > 1 else bin_indices[idx]
+
+                    # Ensure indices are properly shaped scalars
+                    bin_i = int(bin_i.item() if torch.is_tensor(bin_i) else bin_i)
+                    bin_j = int(bin_j.item() if torch.is_tensor(bin_j) else bin_j)
+
+                    adjustment = float(adjustments[idx].item() if torch.is_tensor(adjustments[idx]) else adjustments[idx])
+
+                    # Update weight with proper shape handling
+                    self.histogram_weights[class_id][pair_idx][bin_i, bin_j] += adjustment
+
+
+    def get_histogram_weights(self, class_id: int, pair_idx: int) -> torch.Tensor:
+        """Get weights ensuring proper dimensions"""
+        class_id = int(class_id)
+        pair_idx = int(pair_idx)
+
+        if class_id not in self.histogram_weights:
+            raise KeyError(f"Invalid class_id: {class_id}")
+        if pair_idx not in self.histogram_weights[class_id]:
+            raise KeyError(f"Invalid pair_idx: {pair_idx}")
+
+        weights = self.histogram_weights[class_id][pair_idx]
+        if len(weights.shape) != 2:
+            raise ValueError(f"Invalid weight shape: {weights.shape}, expected 2D tensor")
+        if weights.shape[0] != self.n_bins_per_dim or weights.shape[1] != self.n_bins_per_dim:
+            raise ValueError(f"Invalid weight dimensions: {weights.shape}, expected ({self.n_bins_per_dim}, {self.n_bins_per_dim})")
+
+        return weights
+
+    def update_weight_old(self, class_id: int, pair_idx: int, bin_i: int, bin_j: int, adjustment: float):
+        """Update a single weight value with proper indexing"""
+        try:
+            weights = self.get_histogram_weights(class_id, pair_idx)
+
+            # Ensure indices are within bounds
+            bin_i = min(max(0, bin_i), self.n_bins_per_dim - 1)
+            bin_j = min(max(0, bin_j), self.n_bins_per_dim - 1)
+
+            # Update single value
+            current_weight = weights[bin_i, bin_j].item()
+            weights[bin_i, bin_j] = current_weight + adjustment
+
+        except Exception as e:
+            DEBUG.log(f"Error updating weight:")
+            DEBUG.log(f"class_id: {class_id}, pair_idx: {pair_idx}")
+            DEBUG.log(f"bin_i: {bin_i}, bin_j: {bin_j}")
+            DEBUG.log(f"adjustment: {adjustment}")
+            DEBUG.log(f"Error: {str(e)}")
+            raise
+
+    def _ensure_buffers(self, batch_size):
+        """Ensure buffers exist and are the right size"""
+        if (self.batch_indices_buffer is None or
+            self.batch_indices_buffer.shape[0] < batch_size):
+            self.batch_indices_buffer = torch.zeros(
+                (batch_size, 2),
+                dtype=torch.long,
+                device=next(iter(next(iter(self.histogram_weights.values())).values())).device
+            ).contiguous()
+
+            self.batch_adjustments_buffer = torch.zeros(
+                batch_size,
+                dtype=torch.float32,
+                device=self.batch_indices_buffer.device
+            ).contiguous()
+
+    def update_weight(self, class_id: int, pair_idx: int, bin_i: int, bin_j: int, adjustment: float):
+        """Single weight update with proper error handling"""
+        try:
+            # Convert all indices to integers
+            class_id = int(class_id)
+            pair_idx = int(pair_idx)
+            bin_i = int(bin_i)
+            bin_j = int(bin_j)
+
+            # Ensure indices are within bounds
+            bin_i = min(max(0, bin_i), self.n_bins_per_dim - 1)
+            bin_j = min(max(0, bin_j), self.n_bins_per_dim - 1)
+
+            # Update the weight
+            self.histogram_weights[class_id][pair_idx][bin_i, bin_j] += adjustment
+
+        except Exception as e:
+            print(f"Error updating weight: {str(e)}")
+            print(f"class_id: {class_id}, pair_idx: {pair_idx}")
+            print(f"bin_i: {bin_i}, bin_j: {bin_j}")
+            print(f"adjustment: {adjustment}")
+            raise
+
+    def update_histogram_weights(self, failed_case, true_class, pred_class,
+                               bin_indices, posteriors, learning_rate):
+        """Update weights with proper type checking"""
+        try:
+            # Ensure proper types
+            true_class = int(true_class)
+            pred_class = int(pred_class)
+
+            # Get the posterior values needed for adjustment
+            true_posterior = float(posteriors[true_class])
+            pred_posterior = float(posteriors[pred_class])
+
+            # Calculate weight adjustment
+            adjustment = learning_rate * (1.0 - (true_posterior / pred_posterior))
+
+            for pair_idx, (bin_i, bin_j) in bin_indices.items():
+                # Ensure integer indices
+                pair_idx = int(pair_idx)
+                bin_i = int(bin_i)
+                bin_j = int(bin_j)
+
+                # Get and update weights
+                weights = self.histogram_weights[true_class][pair_idx]
+                weights[bin_i, bin_j] += adjustment
+
+        except Exception as e:
+            DEBUG.log(f"Error updating histogram weights:")
+            DEBUG.log(f"- True class: {true_class}")
+            DEBUG.log(f"- Pred class: {pred_class}")
+            DEBUG.log(f"- Adjustment: {adjustment}")
+            DEBUG.log(f"- Error: {str(e)}")
+            raise
+
+    def update_gaussian_weights(self, failed_case, true_class, pred_class,
+                               component_responsibilities, posteriors, learning_rate):
+        """Update weights for Gaussian components with improved efficiency"""
+        DEBUG.log(f" Updating Gaussian weights for class {true_class}")
+
+        try:
+            # Convert tensor values to Python types and validate
+            true_class = int(true_class) if isinstance(true_class, torch.Tensor) else true_class
+            pred_class = int(pred_class) if isinstance(pred_class, torch.Tensor) else pred_class
+
+            if true_class not in self.gaussian_weights:
+                raise ValueError(f"Invalid true_class: {true_class}")
+
+            # Get posterior values with type checking
+            true_posterior = float(posteriors[true_class]) if isinstance(posteriors, torch.Tensor) else posteriors[true_class]
+            pred_posterior = float(posteriors[pred_class]) if isinstance(posteriors, torch.Tensor) else posteriors[pred_class]
+
+            # Calculate adjustment based on posterior ratio with stability check
+            adjustment = learning_rate * (1.0 - max(min(true_posterior / pred_posterior, 10), 0.1))
+            DEBUG.log(f" Weight adjustment: {adjustment}")
+
+            # Process each feature pair efficiently
+            for pair_idx in range(len(self.feature_pairs)):
+                # Get and validate responsibility matrix
+                resp_matrix = component_responsibilities[pair_idx]
+                if not isinstance(resp_matrix, torch.Tensor):
+                    resp_matrix = torch.tensor(resp_matrix)
+                resp_matrix = resp_matrix.to(self.gaussian_weights[true_class][pair_idx].device)
+
+                # Ensure shapes match
+                current_weights = self.gaussian_weights[true_class][pair_idx]
+                if resp_matrix.shape != current_weights.shape:
+                    DEBUG.log(f" Shape mismatch - resp_matrix: {resp_matrix.shape}, weights: {current_weights.shape}")
+                    resp_matrix = resp_matrix[:current_weights.shape[0], :current_weights.shape[1]]
+
+                # Update weights with stability check
+                weight_update = resp_matrix * adjustment
+                weight_update = torch.clamp(weight_update, -1.0, 1.0)  # Prevent extreme updates
+                self.gaussian_weights[true_class][pair_idx] += weight_update
+
+                # Apply non-negativity constraint
+                self.gaussian_weights[true_class][pair_idx].clamp_(min=0.0)
+
+        except Exception as e:
+            DEBUG.log(f" Error updating Gaussian weights: {str(e)}")
+            DEBUG.log(" Traceback:", traceback.format_exc())
+            raise
+
+    def get_gaussian_weights(self, class_id, pair_idx):
+        """Get Gaussian weights with proper type conversion and validation"""
+        try:
+            # Convert tensor values to Python integers
+            class_id = int(class_id) if isinstance(class_id, torch.Tensor) else class_id
+            pair_idx = int(pair_idx) if isinstance(pair_idx, torch.Tensor) else pair_idx
+
+            if class_id not in self.gaussian_weights:
+                raise KeyError(f"Invalid class_id: {class_id}")
+            if pair_idx not in self.gaussian_weights[class_id]:
+                raise KeyError(f"Invalid pair_idx: {pair_idx}")
+
+            weights = self.gaussian_weights[class_id][pair_idx]
+            DEBUG.log(f" Retrieved Gaussian weights for class {class_id}, pair {pair_idx}, shape: {weights.shape}")
+            return weights
+
+        except Exception as e:
+            DEBUG.log(f" Error retrieving Gaussian weights: {str(e)}")
+            DEBUG.log(" Traceback:", traceback.format_exc())
+            raise
+
+    # Modified posterior computation for Histogram model
+    def compute_histogram_posterior(self, features, bin_indices):
+        batch_size = features.shape[0]
+        n_classes = len(self.likelihood_params['classes'])
+        log_likelihoods = torch.zeros((batch_size, n_classes), device=self.device)
+
+        for group_idx, feature_group in enumerate(self.likelihood_params['feature_pairs']):
+            bin_edges = self.likelihood_params['bin_edges'][group_idx]
+            bin_probs = self.likelihood_params['bin_probs'][group_idx]
+
+            # Get bin-specific weights
+            bin_weights = self.weight_updater.get_histogram_weights(
+                class_idx,
+                group_idx
+            )[bin_indices[group_idx]]
+
+            # Apply bin-specific weights to probabilities
+            weighted_probs = bin_probs * bin_weights.unsqueeze(0)
+
+            # Continue with regular posterior computation...
+            group_log_likelihoods = torch.log(weighted_probs + epsilon)
+            log_likelihoods.add_(group_log_likelihoods)
+
+        return log_likelihoods
+
+    # Modified posterior computation for Gaussian model
+    def compute_gaussian_posterior(self, features, component_responsibilities):
+        batch_size = features.shape[0]
+        n_classes = len(self.likelihood_params['classes'])
+        log_likelihoods = torch.zeros((batch_size, n_classes), device=self.device)
+
+        for group_idx, feature_group in enumerate(self.likelihood_params['feature_pairs']):
+            # Get component-specific weights
+            component_weights = self.weight_updater.get_gaussian_weights(
+                class_idx,
+                group_idx
+            )
+
+            # Weight the Gaussian components
+            weighted_resp = component_responsibilities[group_idx] * component_weights
+
+            # Continue with regular posterior computation...
+            group_log_likelihoods = torch.log(weighted_resp.sum() + epsilon)
+            log_likelihoods.add_(group_log_likelihoods)
+
+        return log_likelihoods
 
 #----------------------------------------------DBNN class-------------------------------------------------------------
 class GPUDBNN:
     """GPU-Optimized Deep Bayesian Neural Network with Parallel Feature Pair Processing"""
 
-    def __init__(
-        self,
-        dataset_name: str,
-        learning_rate: float = LearningRate,
-        max_epochs: int = Epochs,
-        test_size: float = TestFraction,
-        random_state: int = TrainingRandomSeed,
-        device: str = None,
-        fresh: bool = False,
-        use_previous_model: bool = True
-    ):
+    def __init__(self, dataset_name: str, learning_rate: float = LearningRate,
+                 max_epochs: int = Epochs, test_size: float = TestFraction,
+                 random_state: int = TrainingRandomSeed, device: str = None,
+                 fresh: bool = False, use_previous_model: bool = True,
+                 n_bins_per_dim: int = 20):
+
         # Set dataset_name first
         self.dataset_name = dataset_name.lower()
+        self.device = Train_device
+        self.computation_cache = ComputationCache(self.device)
+
+        # Add new attribute for bin-specific weights
+        self.n_bins_per_dim = n_bins_per_dim
+        self.weight_updater = None  # Will be initialized after computing likelihood params
 
         # Load configuration before potential cleanup
         self.config = DatasetConfig.load_config(self.dataset_name)
         self.feature_bounds = None  # Store global min/max for each
 
         # Initialize other attributes
-        self.device = Train_device
+
         self.learning_rate = learning_rate
         self.max_epochs = max_epochs
         self.test_size = test_size
@@ -307,6 +688,15 @@ class GPUDBNN:
         self.best_W = None
         self.best_error = float('inf')
         self.current_W = None
+
+        # Enable cuDNN autotuner if using CUDA
+        if self.device.startswith('cuda'):
+            torch.backends.cudnn.benchmark = True
+
+        # Pin memory for faster CPU->GPU transfer
+        if torch.cuda.is_available():
+            self.pin_memory = True
+            torch.cuda.empty_cache()
 
         # Handle fresh start after configuration is loaded
         # Handle model state based on flags
@@ -372,6 +762,148 @@ class GPUDBNN:
         self._load_best_weights()
         self._load_categorical_encoders()
 
+#----------------------
+    def prepare_batch(self, features):
+        """Efficient batch preparation"""
+        if not features.is_contiguous():
+            features = features.contiguous()
+
+        if self.device.startswith('cuda') and not features.is_cuda:
+            features = features.cuda(non_blocking=True)
+
+        return features
+    def _load_dataset(self) -> pd.DataFrame:
+        """Load and preprocess dataset with improved error handling"""
+        DEBUG.log(f" Loading dataset from config: {self.config}")
+        file_path = self.config['file_path']
+
+        try:
+            # Handle URL or local file
+            if file_path.startswith(('http://', 'https://')):
+                DEBUG.log(f" Loading from URL: {file_path}")
+                response = requests.get(file_path)
+                response.raise_for_status()
+                data = StringIO(response.text)
+            else:
+                DEBUG.log(f" Loading from local file: {file_path}")
+                if not os.path.exists(file_path):
+                    raise FileNotFoundError(f"Dataset file not found: {file_path}")
+                data = file_path
+
+            # Read CSV with appropriate parameters
+            read_params = {
+                'sep': self.config['separator'],
+                'header': 0 if self.config['has_header'] else None,
+                'names': self.config.get('column_names'),
+            }
+            DEBUG.log(f" Reading CSV with parameters: {read_params}")
+
+            df = pd.read_csv(data, **read_params)
+            DEBUG.log(f" Loaded DataFrame shape: {df.shape}")
+
+            # Filter features based on config
+            if 'column_names' in self.config:
+                DEBUG.log(" Filtering features based on config")
+                df = _filter_features_from_config(df, self.config)
+                DEBUG.log(f" Shape after filtering: {df.shape}")
+
+            # Handle target column
+            if isinstance(self.config['target_column'], int):
+                # If target column is specified by index
+                cols = df.columns.tolist()
+                if self.config['target_column'] >= len(cols):
+                    raise ValueError(f"Target column index {self.config['target_column']} is out of range")
+                self.config['target_column'] = cols[self.config['target_column']]
+                DEBUG.log(f" Using target column: {self.config['target_column']}")
+
+            # Verify target column exists
+            if self.config['target_column'] not in df.columns:
+                raise ValueError(f"Target column '{self.config['target_column']}' not found in dataset")
+
+            # Basic data validation
+            if df.empty:
+                raise ValueError("Loaded dataset is empty")
+
+            DEBUG.log(f" Dataset loaded successfully. Shape: {df.shape}")
+            DEBUG.log(f" Columns: {df.columns.tolist()}")
+            DEBUG.log(f" Data types:\n{df.dtypes}")
+
+            return df
+
+        except Exception as e:
+            DEBUG.log(f" Error loading dataset: {str(e)}")
+            DEBUG.log(" Stack trace:", traceback.format_exc())
+            raise RuntimeError(f"Failed to load dataset: {str(e)}")
+
+
+    def _compute_batch_posterior(self, features: torch.Tensor, epsilon: float = 1e-10):
+        """Optimized batch posterior with vectorized operations"""
+        if modelType == "Gaussian":
+            return self._compute_batch_posterior_std(features, epsilon)
+
+        # Ensure input features are contiguous
+        if not features.is_contiguous():
+            features = features.contiguous()
+
+        batch_size = features.shape[0]
+        n_classes = len(self.likelihood_params['classes'])
+
+        # Pre-allocate tensors
+        log_likelihoods = torch.zeros((batch_size, n_classes), device=self.device)
+
+        # Process all feature pairs at once
+        feature_groups = torch.stack([
+            features[:, pair].contiguous()
+            for pair in self.likelihood_params['feature_pairs']
+        ]).transpose(0, 1)  # [batch_size, n_pairs, 2]
+
+        # Compute all bin indices at once
+        bin_indices_list = []
+        for group_idx in range(len(self.likelihood_params['feature_pairs'])):
+            bin_edges = self.likelihood_params['bin_edges'][group_idx]
+            edges = torch.stack([edge.contiguous() for edge in bin_edges])
+
+            # Vectorized binning with contiguous tensors
+            indices = torch.stack([
+                torch.bucketize(
+                    feature_groups[:, group_idx, dim].contiguous(),
+                    edges[dim].contiguous()
+                )
+                for dim in range(2)
+            ])  # [2, batch_size]
+            indices = indices.sub_(1).clamp_(0, self.n_bins_per_dim - 1)
+            bin_indices_list.append(indices)
+
+        # Process all classes simultaneously
+        for group_idx in range(len(self.likelihood_params['feature_pairs'])):
+            bin_probs = self.likelihood_params['bin_probs'][group_idx]  # [n_classes, n_bins, n_bins]
+            indices = bin_indices_list[group_idx]  # [2, batch_size]
+
+            # Get all weights at once
+            weights = torch.stack([
+                self.weight_updater.get_histogram_weights(c, group_idx)
+                for c in range(n_classes)
+            ])  # [n_classes, n_bins, n_bins]
+
+            # Ensure weights are contiguous
+            if not weights.is_contiguous():
+                weights = weights.contiguous()
+
+            # Apply weights to probabilities
+            weighted_probs = bin_probs * weights  # [n_classes, n_bins, n_bins]
+
+            # Gather probabilities for all samples and classes at once
+            probs = weighted_probs[:, indices[0], indices[1]]  # [n_classes, batch_size]
+            log_likelihoods += torch.log(probs.t() + epsilon)
+
+        # Compute posteriors efficiently
+        max_log_likelihood = log_likelihoods.max(dim=1, keepdim=True)[0]
+        posteriors = torch.exp(log_likelihoods - max_log_likelihood)
+        posteriors /= posteriors.sum(dim=1, keepdim=True) + epsilon
+
+        return posteriors, dict(enumerate(bin_indices_list))
+#----------------------
+
     def set_feature_bounds(self, dataset):
         """Initialize global feature bounds from complete dataset"""
         if self.feature_bounds is None:
@@ -430,188 +962,178 @@ class GPUDBNN:
 
         return train_indices, test_indices
 
+
+
     def adaptive_fit_predict(self, max_rounds: int = 10,
-                        improvement_threshold: float = 0.001,
-                        load_epoch: int = None,
-                        batch_size: int = 32):
-        """
-        Adaptive training strategy with proper variable scope handling.
-        """
+                         improvement_threshold: float = 0.001,
+                         load_epoch: int = None,
+                         batch_size: int = 32):
+        """Modified adaptive training strategy to ensure minimum samples per class"""
+
+        DEBUG.log(" Starting adaptive_fit_predict")
         if not EnableAdaptive:
             print("Adaptive learning is disabled. Using standard training.")
             return self.fit_predict(batch_size=batch_size)
 
         self.in_adaptive_fit = True
 
-        # Get initial data
-        X = self.data.drop(columns=[self.target_column])
-        y = self.data[self.target_column]
-        self.set_feature_bounds(X)
+        try:
+            # Get initial data
+            X = self.data.drop(columns=[self.target_column])
+            y = self.data[self.target_column]
+            DEBUG.log(f" Initial data shape: X={X.shape}, y={len(y)}")
 
-        # Use existing label encoder
-        y_encoded = self.label_encoder.fit_transform(y)
-        unique_classes = np.unique(y_encoded)
-        original_classes = self.label_encoder.inverse_transform(unique_classes)
+            # Initialize label encoder if not already done
+            if not hasattr(self.label_encoder, 'classes_'):
+                self.label_encoder.fit(y)
 
-        # Define last_epoch_file at the proper scope
-        last_epoch_file = os.path.join(self.base_save_path, f'{self.dataset_name}_last_epoch.txt')
+            # Use existing label encoder
+            y_encoded = self.label_encoder.transform(y)  # Changed from fit_transform to transform
+            unique_classes = np.unique(y_encoded)
+            original_classes = self.label_encoder.inverse_transform(unique_classes)
+            DEBUG.log(f" Number of unique classes: {len(unique_classes)}")
+            DEBUG.log(f" Unique classes: {unique_classes}")
 
-        # Try to load last training state
-        train_indices = None
-        test_indices = None
-        start_round = 0
+            # Verify we have the likelihood parameters
+            if self.likelihood_params is None:
+                DEBUG.log(" Initializing likelihood parameters")
+                X_tensor = torch.FloatTensor(self._preprocess_data(X, is_training=True)).to(self.device)
+                y_tensor = torch.LongTensor(y_encoded).to(self.device)
 
-        if not self.fresh_start:
-            # Load last known good split
-            train_indices, test_indices = self.load_last_known_split()
-            if train_indices is not None:
-                print("Continuing with previous training/testing split")
-                if os.path.exists(os.path.join(self.base_save_path, f'{self.dataset_name}_last_epoch.txt')):
-                    with open(os.path.join(self.base_save_path, f'{self.dataset_name}_last_epoch.txt'), 'r') as f:
-                        start_round = int(f.read().strip()) + 1
-                print(f"Continuing from round {start_round}")
-        else:
-            if not self.use_previous_model:
-                print("Starting fresh training with new model")
-                self._clean_existing_model()
-            else:
-                print("Starting fresh training with previous model weights")
+                if modelType == "Histogram":
+                    self.likelihood_params = self._compute_pairwise_likelihood_parallel(
+                        X_tensor, y_tensor, X_tensor.shape[1]
+                    )
+                elif modelType == "Gaussian":
+                    self.likelihood_params = self._compute_pairwise_likelihood_parallel_std(
+                        X_tensor, y_tensor, X_tensor.shape[1]
+                    )
+                DEBUG.log(" Likelihood parameters computed")
 
-        # Initialize new training if needed
-        if train_indices is None:
-            print("Initializing new training data split")
+            # Initialize new training if needed
             train_indices = []
             class_indices = defaultdict(list)
 
             # Group indices by class
+            DEBUG.log(" Grouping indices by class")
             for idx, label in enumerate(y_encoded):
                 class_indices[label].append(idx)
 
-            # Select one example per class
+            DEBUG.log(" Class distribution before selection:")
             for class_label in unique_classes:
-                train_indices.append(class_indices[class_label][0])
+                print(f"Class {class_label}: {len(class_indices[class_label])} samples")
 
-            # Initialize test_indices with ALL remaining indices
+            # Select minimum required samples per class
+            min_samples_per_class = 2  # Minimum number of samples needed per class
+            for class_label in unique_classes:
+                available_samples = len(class_indices[class_label])
+                if available_samples < min_samples_per_class:
+                    raise ValueError(f"Class {class_label} has only {available_samples} samples, "
+                                   f"need at least {min_samples_per_class}")
+                selected_indices = class_indices[class_label][:min_samples_per_class]
+                train_indices.extend(selected_indices)
+
+            DEBUG.log(f" Initial training set size: {len(train_indices)}")
+
+            # Initialize test_indices with remaining indices
             all_indices = set(range(len(X)))
             test_indices = list(all_indices - set(train_indices))
+            DEBUG.log(f" Initial test set size: {len(test_indices)}")
 
-            start_round = 0
+            # Initialize model weights if needed
+            if self.current_W is None:
+                DEBUG.log(" Initializing model weights")
+                n_classes = len(unique_classes)
+                n_pairs = len(self.feature_pairs) if self.feature_pairs is not None else 0
+                if n_pairs == 0:
+                    raise ValueError("Feature pairs not initialized")
+                self.current_W = torch.full((n_classes, n_pairs), 0.1,
+                                          device=self.device, dtype=torch.float32)
+                if self.best_W is None:
+                    self.best_W = self.current_W.clone()
 
-        max_rounds = max_rounds + start_round
-        history = {
-            'round': [],
-            'train_size': [],
-            'test_size': [],
-            'accuracy': [],
-            'misclassified': []
-        }
+            # Training loop
+            for round_num in range(max_rounds):
+                print(f"\nRound {round_num + 1}/{max_rounds}")
+                print(f"Training set size: {len(train_indices)}")
+                print(f"Test set size: {len(test_indices)}")
 
-        best_accuracy = 0
-        rounds_without_improvement = 0
+                # Create feature tensors for training
+                X_train = X.iloc[train_indices]
+                y_train = y.iloc[train_indices]
+                DEBUG.log(f" Training shapes - X: {X_train.shape}, y: {len(y_train)}")
 
-        for round_num in range(start_round, max_rounds):
-            print(f"\nRound {round_num + 1}/{max_rounds}")
-            print(f"Training set size: {len(train_indices)}")
-            print(f"Test set size: {len(test_indices)}")
+                # Convert to tensors
+                X_train_tensor = torch.FloatTensor(self._preprocess_data(X_train, is_training=False)).to(self.device)
+                y_train_tensor = torch.LongTensor(self.label_encoder.transform(y_train)).to(self.device)
 
-            # Create masks for current train/test split
-            train_mask = torch.zeros(len(X), dtype=torch.bool, device=self.device)
-            train_mask[train_indices] = True
+                # Train and predict
+                save_path = f"round_{round_num}_predictions.csv"
+                results = self.fit_predict(batch_size=batch_size, save_path=save_path)
 
-            # Use remaining data for testing
-            test_mask = torch.zeros(len(X), dtype=torch.bool, device=self.device)
-            test_mask[test_indices] = True
+                if results is None:
+                    raise ValueError("fit_predict returned None")
 
-            # Save current epoch data
-            self.save_epoch_data(round_num, train_indices, test_indices)
+                # Process predictions file
+                if not os.path.exists(save_path):
+                    raise FileNotFoundError(f"Predictions file {save_path} not found")
 
-            # Train and predict
-            save_path = f"round_{round_num}_predictions.csv"
-            total_start = time.time()
-            results = self.fit_predict(batch_size=batch_size, save_path=save_path)
-            total_end = time.time()
-            print(f"Total training time for round {round_num} is: {total_end - total_start:.2f} seconds")
-            current_accuracy = results['test_accuracy']
+                predictions_df = pd.read_csv(save_path)
+                test_predictions_df = predictions_df[predictions_df.index.isin(test_indices)]
 
-            if not self.adaptive_learning:
-                print("Adaptive learning disabled. Training with current data only.")
-                break
+                if len(test_predictions_df) == 0:
+                    DEBUG.log(" No test predictions found")
+                    break
 
-            # Process predictions
-            predictions_df = pd.read_csv(save_path)
-            test_predictions_df = predictions_df[predictions_df.index.isin(test_indices)]
-            predictions = test_predictions_df['predicted_class'].values
-            true_labels = test_predictions_df['true_class'].values
+                # Update training set with misclassified examples
+                misclassified = test_predictions_df[
+                    test_predictions_df['predicted_class'] != test_predictions_df['true_class']
+                ]
 
-            # Get probability columns
-            prob_columns = [f'prob_{class_label}' for class_label in original_classes]
-            probabilities = test_predictions_df[prob_columns].values
+                if len(misclassified) == 0:
+                    print("Achieved 100% accuracy on remaining data. Stopping.")
+                    break
 
-            # Find misclassified examples in test set
-            misclassified_mask = (predictions != true_labels)
-            misclassified_indices = np.where(misclassified_mask)[0]
+                # Select new training examples
+                new_train_indices = misclassified.index.tolist()[:2]  # Take 2 misclassified examples
+                train_indices.extend(new_train_indices)
+                test_indices = list(set(test_indices) - set(new_train_indices))
 
-            # Save the last epoch number
-            with open(last_epoch_file, 'w') as f:
-                f.write(str(round_num))
+                # Clean up
+                if os.path.exists(save_path):
+                    os.remove(save_path)
 
-            # Update history
-            history['round'].append(round_num + 1)
-            history['train_size'].append(len(train_indices))
-            history['test_size'].append(len(test_indices))
-            history['accuracy'].append(current_accuracy)
-            history['misclassified'].append(len(misclassified_indices))
+            self.save_last_split(train_indices, test_indices)
+            self.in_adaptive_fit = False
+            return {'train_indices': train_indices, 'test_indices': test_indices}
 
-            print(f"Current accuracy on remaining data: {current_accuracy:.4f}")
-            print(f"Misclassified examples in remaining data: {len(misclassified_indices)}")
-
-            # Check if we have 100% accuracy on remaining data
-            if len(misclassified_indices) == 0:
-                print("Achieved 100% accuracy on remaining data. Stopping.")
-                break
-
-            # Select both most confident and least confident misclassifications
-            new_train_indices = []
-            for class_idx, class_label in enumerate(unique_classes):
-                # Find misclassified examples predicted as this class
-                class_mask = (predictions == class_label) & misclassified_mask
-                if np.any(class_mask):
-                    # Get probabilities for predicted class using original class label
-                    original_class = original_classes[class_idx]
-                    prob_col = f'prob_{original_class}'
-                    class_probs = test_predictions_df[prob_col].values[class_mask]
-
-                    # Get indices of both max and min probability cases
-                    mask_indices = np.where(class_mask)[0]
-                    if len(class_probs) > 0:
-                        max_prob_idx = mask_indices[np.argmax(class_probs)]
-                        min_prob_idx = mask_indices[np.argmin(class_probs)]
-                        max_original_idx = test_indices[max_prob_idx]
-                        min_original_idx = test_indices[min_prob_idx]
-                        new_train_indices.extend([max_original_idx, min_original_idx])
-
-            # Update train and test sets
-            train_indices.extend(new_train_indices)
-            test_indices = list(set(test_indices) - set(new_train_indices))
-
-            # Clean up prediction file
-            if os.path.exists(save_path):
-                os.remove(save_path)
-
-        # Save final history
-        with open(os.path.join(self.base_save_path, f'{modelType}_training_history.json'), 'w') as f:
-            json.dump(history, f)
-
-        self.save_last_split(train_indices, test_indices)
-        self.in_adaptive_fit = False
-        return history
-
+        except Exception as e:
+            DEBUG.log(f" Error in adaptive_fit_predict: {str(e)}")
+            DEBUG.log(" Traceback:", traceback.format_exc())
+            self.in_adaptive_fit = False
+            raise
     #------------------------------------------Adaptive Learning--------------------------------------
     def _calculate_cardinality_threshold(self):
-        """Calculate the cardinality threshold based on the number of distinct classes"""
-        #n_classes = len(self.label_encoder.classes_)
-        #return 1.5 / n_classes
-        return cardinality_threshold
+        """Calculate appropriate cardinality threshold based on dataset characteristics"""
+        n_samples = len(self.data)
+        n_classes = len(self.data[self.target_column].unique())
+
+        # Base threshold from config
+        base_threshold = cardinality_threshold
+
+        # Adjust threshold based on dataset size and number of classes
+        adjusted_threshold = min(
+            base_threshold,
+            max(0.1, 1.0 / np.sqrt(n_classes))  # Lower bound of 0.1
+        )
+
+        DEBUG.log(f"\nCardinality Threshold Calculation:")
+        DEBUG.log(f"- Base threshold: {base_threshold}")
+        DEBUG.log(f"- Number of samples: {n_samples}")
+        DEBUG.log(f"- Number of classes: {n_classes}")
+        DEBUG.log(f"- Adjusted threshold: {adjusted_threshold}")
+
+        return adjusted_threshold
 
 
     def _round_features(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -621,29 +1143,168 @@ class GPUDBNN:
         return df.round(cardinality_tolerance)
 
     def _remove_high_cardinality_columns(self, df: pd.DataFrame, threshold: float = 0.8) -> pd.DataFrame:
-        """Remove high cardinality columns and round features"""
-        # Round all features first if cardinality_tolerance is not -1
-        df_rounded = self._round_features(df)
+        """Remove high cardinality columns with more conservative approach"""
+        DEBUG.log(f"Starting cardinality analysis with threshold {threshold}")
 
-        df_filtered = df_rounded.copy()
+        df_filtered = df.copy()
         columns_to_drop = []
+        cardinality_info = {}
 
+        # First pass: calculate cardinality for all columns
         for column in df.columns:
             if column == self.target_column:
                 continue
-            # Use rounded data for cardinality check
-            unique_ratio = len(df_rounded[column].unique()) / len(df)
-            if unique_ratio > threshold:
-                columns_to_drop.append(column)
 
+            unique_count = len(df[column].unique())
+            unique_ratio = unique_count / len(df)
+            cardinality_info[column] = {
+                'unique_count': unique_count,
+                'ratio': unique_ratio
+            }
+
+            DEBUG.log(f"Column {column}: {unique_count} unique values, ratio {unique_ratio:.4f}")
+
+        # Determine adaptive threshold
+        ratios = [info['ratio'] for info in cardinality_info.values()]
+        if ratios:
+            median_ratio = np.median(ratios)
+            adaptive_threshold = min(threshold, max(median_ratio * 2, 0.1))
+            DEBUG.log(f"Adaptive threshold: {adaptive_threshold} (original: {threshold})")
+        else:
+            adaptive_threshold = threshold
+
+        # Second pass: mark columns for dropping
+        for column, info in cardinality_info.items():
+            if info['ratio'] > adaptive_threshold:
+                columns_to_drop.append(column)
+                DEBUG.log(f"Marking {column} for removal (ratio: {info['ratio']:.4f})")
+
+        # Ensure we keep at least some features
+        if len(columns_to_drop) == len(cardinality_info):
+            DEBUG.log("Would remove all features - keeping lowest cardinality ones")
+            sorted_columns = sorted(cardinality_info.items(), key=lambda x: x[1]['ratio'])
+            keep_count = max(2, len(cardinality_info) // 5)  # Keep at least 2 or 20%
+            columns_to_drop = [col for col, _ in sorted_columns[keep_count:]]
+
+        # Drop columns
         if columns_to_drop:
             df_filtered = df_filtered.drop(columns=columns_to_drop)
+            DEBUG.log(f"Dropped columns: {columns_to_drop}")
 
+        DEBUG.log(f"Features after cardinality filtering: {df_filtered.columns.tolist()}")
         return df_filtered
+
+    def _detect_categorical_columns(self, df: pd.DataFrame) -> List[str]:
+        """Detect categorical columns with improved debugging"""
+        DEBUG.log(" Starting categorical column detection")
+        categorical_columns = []
+
+        for column in df.columns:
+            if column != self.target_column:
+                dtype = df[column].dtype
+                unique_count = len(df[column].unique())
+                DEBUG.log(f" Column {column}: dtype={dtype}, unique values={unique_count}")
+
+                if dtype == 'object' or dtype.name == 'category':
+                    DEBUG.log(f" Adding {column} as categorical (object/category type)")
+                    categorical_columns.append(column)
+                elif dtype in ['int64', 'float64']:
+                    threshold = min(50, len(df) * 0.05)
+                    if unique_count < threshold:
+                        DEBUG.log(f" Adding {column} as categorical (numeric with few unique values: {unique_count} < {threshold})")
+                        categorical_columns.append(column)
+                    else:
+                        DEBUG.log(f" Keeping {column} as numeric (unique values: {unique_count} >= {threshold})")
+
+        DEBUG.log(f" Detected categorical columns: {categorical_columns}")
+        return categorical_columns
+
+    def _preprocess_data(self, X: pd.DataFrame, is_training: bool = True) -> torch.Tensor:
+        """Preprocess data with improved error handling and debugging"""
+        print(f"\n[DEBUG] ====== Starting preprocessing ======")
+        DEBUG.log(f" Input shape: {X.shape}")
+        DEBUG.log(f" Input columns: {X.columns.tolist()}")
+        DEBUG.log(f" Input dtypes:\n{X.dtypes}")
+
+        # Make a copy to avoid modifying original data
+        X = X.copy()
+
+        # Calculate cardinality threshold
+        cardinality_threshold = self._calculate_cardinality_threshold()
+        DEBUG.log(f" Cardinality threshold: {cardinality_threshold}")
+
+        if is_training:
+            DEBUG.log(" Training mode preprocessing")
+            self.original_columns = X.columns.tolist()
+
+            # Remove high cardinality columns
+            X = self._remove_high_cardinality_columns(X, cardinality_threshold)
+            DEBUG.log(f" Shape after cardinality filtering: {X.shape}")
+
+            self.feature_columns = X.columns.tolist()
+            DEBUG.log(f" Selected feature columns: {self.feature_columns}")
+
+            # Store high cardinality columns
+            self.high_cardinality_columns = list(set(self.original_columns) - set(self.feature_columns))
+            if self.high_cardinality_columns:
+                DEBUG.log(f" Removed high cardinality columns: {self.high_cardinality_columns}")
+        else:
+            DEBUG.log(" Prediction mode preprocessing")
+            if not hasattr(self, 'feature_columns'):
+                raise ValueError("Model not trained - feature columns not found")
+
+            if hasattr(self, 'high_cardinality_columns'):
+                X = X.drop(columns=self.high_cardinality_columns, errors='ignore')
+
+            missing_cols = set(self.feature_columns) - set(X.columns)
+            if missing_cols:
+                raise ValueError(f"Missing required columns: {missing_cols}")
+
+            X = X[self.feature_columns]
+
+        # Handle categorical features
+        DEBUG.log(" Starting categorical encoding")
+        try:
+            X_encoded = self._encode_categorical_features(X, is_training)
+            DEBUG.log(f" Shape after categorical encoding: {X_encoded.shape}")
+            DEBUG.log(f" Encoded dtypes:\n{X_encoded.dtypes}")
+        except Exception as e:
+            DEBUG.log(f" Error in categorical encoding: {str(e)}")
+            raise
+
+        # Convert to numpy and check for issues
+        try:
+            X_numpy = X_encoded.to_numpy()
+            DEBUG.log(f" Numpy array shape: {X_numpy.shape}")
+            DEBUG.log(f" Any NaN: {np.isnan(X_numpy).any()}")
+            DEBUG.log(f" Any Inf: {np.isinf(X_numpy).any()}")
+        except Exception as e:
+            DEBUG.log(f" Error converting to numpy: {str(e)}")
+            raise
+
+        # Scale the features
+        try:
+            if is_training:
+                X_scaled = self.scaler.fit_transform(X_numpy)
+            else:
+                X_scaled = self.scaler.transform(X_numpy)
+        except Exception as e:
+            DEBUG.log(f" Standard scaling failed: {str(e)}. Using manual scaling")
+            if X_numpy.size == 0:
+                print("[WARNING] Empty feature array! Returning original data")
+                X_scaled = X_numpy
+            else:
+                means = np.nanmean(X_numpy, axis=0)
+                stds = np.nanstd(X_numpy, axis=0)
+                stds[stds == 0] = 1
+                X_scaled = (X_numpy - means) / stds
+
+        DEBUG.log(f" Final preprocessed shape: {X_scaled.shape}")
+        return torch.FloatTensor(X_scaled)
 
     def _generate_feature_combinations(self, n_features: int, group_size: int, max_combinations: int = None) -> torch.Tensor:
         """
-        Generate feature combinations of specified size
+        Generate feature combinations of specified size with validation checks
 
         Args:
             n_features: Total number of features
@@ -653,8 +1314,15 @@ class GPUDBNN:
         Returns:
             Tensor containing feature combinations
         """
+        if n_features < group_size:
+            raise ValueError(f"Number of features ({n_features}) must be >= group size ({group_size})")
+
         # Generate all possible combinations
         all_combinations = list(combinations(range(n_features), group_size))
+
+        if not all_combinations:
+            # If no combinations were generated, raise an error
+            raise ValueError(f"No valid combinations generated for {n_features} features in groups of {group_size}")
 
         # If max_combinations specified and less than total combinations,
         # randomly sample combinations
@@ -663,14 +1331,20 @@ class GPUDBNN:
             random.seed(self.random_state)
             all_combinations = random.sample(all_combinations, max_combinations)
 
-        return torch.tensor(all_combinations).to(self.device)
+        # Convert to tensor and ensure it's on the correct device
+        combinations_tensor = torch.tensor(all_combinations, device=self.device)
+
+        # Validate the output tensor
+        if combinations_tensor.nelement() == 0:
+            raise ValueError("Generated empty feature combinations tensor")
+
+        return combinations_tensor
 #-----------------------------------------------------------------------------Bin model ---------------------------
 
     def _compute_pairwise_likelihood_parallel(self, dataset: torch.Tensor, labels: torch.Tensor, feature_dims: int):
-        """
-        Optimized non-parametric likelihood computation using adaptive binning.
-        Uses tensor operations and minimizes memory allocations.
-        """
+        """Optimized non-parametric likelihood computation with configurable bin sizes"""
+        DEBUG.log(" Starting _compute_pairwise_likelihood_parallel")
+
         # Input validation and preparation
         dataset = torch.as_tensor(dataset, device=self.device).contiguous()
         labels = torch.as_tensor(labels, device=self.device).contiguous()
@@ -680,10 +1354,370 @@ class GPUDBNN:
         n_classes = len(unique_classes)
         n_samples = len(dataset)
 
-        # Optimize bin size based on data
-        n_bins_per_dim = max(5, min(20, int(pow(n_samples, 1/3))))
+        # Get bin sizes from configuration
+        bin_sizes = self.config.get('likelihood_config', {}).get('bin_sizes', [5])
+        if len(bin_sizes) == 1:
+            # If single bin size provided, use it for all dimensions
+            n_bins = bin_sizes[0]
+            self.n_bins_per_dim = n_bins  # Store for reference
+            DEBUG.log(f" Using uniform {n_bins} bins per dimension")
+        else:
+            DEBUG.log(f" Using variable bin sizes: {bin_sizes}")
 
-        # Generate feature combinations efficiently
+        # Generate feature combinations
+        self.feature_pairs = self._generate_feature_combinations(
+            feature_dims,
+            self.config.get('likelihood_config', {}).get('feature_group_size', 2),
+            self.config.get('likelihood_config', {}).get('max_combinations', None)
+        ).to(self.device)
+
+        # Pre-allocate storage arrays
+        all_bin_edges = []
+        all_bin_counts = []
+        all_bin_probs = []
+
+        # Process each feature group
+        for feature_group in self.feature_pairs:
+            feature_group = [int(x) for x in feature_group]
+            DEBUG.log(f" Processing feature group: {feature_group}")
+
+            # Extract group data
+            group_data = dataset[:, feature_group].contiguous()
+            n_dims = len(feature_group)
+
+            # Get appropriate bin sizes for this group
+            group_bin_sizes = bin_sizes[:n_dims] if len(bin_sizes) > 1 else [bin_sizes[0]] * n_dims
+
+            # Compute bin edges for all dimensions
+            bin_edges = []
+            for dim in range(n_dims):
+                dim_data = group_data[:, dim].contiguous()
+                dim_min, dim_max = dim_data.min(), dim_data.max()
+                padding = (dim_max - dim_min) * 0.01
+
+                edges = torch.linspace(
+                    dim_min - padding,
+                    dim_max + padding,
+                    group_bin_sizes[dim] + 1,  # Use configured bin size for this dimension
+                    device=self.device
+                ).contiguous()
+                bin_edges.append(edges)
+                DEBUG.log(f" Dimension {dim} edges range: {edges[0].item():.3f} to {edges[-1].item():.3f}")
+
+            # Initialize bin counts with appropriate shape for variable bin sizes
+            bin_shape = [n_classes] + [size for size in group_bin_sizes]
+            bin_counts = torch.zeros(bin_shape, device=self.device, dtype=torch.float32)
+
+            # Process each class
+            for class_idx, class_label in enumerate(unique_classes):
+                class_mask = labels == class_label
+                if class_mask.any():
+                    class_data = group_data[class_mask].contiguous()
+
+                    if n_dims == 2:  # Optimized path for pairs
+                        # Compute bin indices for both dimensions
+                        bin_indices = torch.stack([
+                            torch.bucketize(
+                                class_data[:, dim].contiguous(),
+                                bin_edges[dim].contiguous()
+                            ).sub_(1).clamp_(0, group_bin_sizes[dim] - 1)
+                            for dim in range(2)
+                        ])
+
+                        # Use scatter_add_ for efficient counting
+                        counts = torch.zeros(group_bin_sizes[0] * group_bin_sizes[1], device=self.device)
+                        flat_indices = bin_indices[0] * group_bin_sizes[1] + bin_indices[1]
+                        counts.scatter_add_(0, flat_indices, torch.ones_like(flat_indices, dtype=torch.float32))
+                        bin_counts[class_idx] = counts.reshape(group_bin_sizes[0], group_bin_sizes[1])
+
+            # Apply Laplace smoothing and compute probabilities
+            smoothed_counts = bin_counts + 1.0
+            bin_probs = smoothed_counts / smoothed_counts.sum(dim=tuple(range(1, n_dims + 1)), keepdim=True)
+
+            # Store results
+            all_bin_edges.append(bin_edges)
+            all_bin_counts.append(smoothed_counts)
+            all_bin_probs.append(bin_probs)
+
+            DEBUG.log(f" Bin counts shape: {smoothed_counts.shape}")
+            DEBUG.log(f" Bin probs shape: {bin_probs.shape}")
+
+        return {
+            'bin_edges': all_bin_edges,
+            'bin_counts': all_bin_counts,
+            'bin_probs': all_bin_probs,
+            'feature_pairs': self.feature_pairs,
+            'classes': unique_classes.to(self.device)
+        }
+
+ #----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+    def _compute_pairwise_likelihood_parallel_std(self, dataset: torch.Tensor, labels: torch.Tensor, feature_dims: int):
+        """Optimized Gaussian likelihood computation - Gaussian specific method"""
+        dataset = dataset.to(self.device)
+        labels = labels.to(self.device)
+
+        # Use existing feature pair generation (shared method)
+        max_combinations = self.config.get('likelihood_config', {}).get('max_combinations', None)
+        self.feature_pairs = self._generate_feature_combinations(
+            feature_dims,
+            2,
+            max_combinations
+        )
+
+        unique_classes = torch.unique(labels)
+        n_classes = len(unique_classes)
+        n_pairs = len(self.feature_pairs)
+
+        # Initialize parameters
+        means = torch.zeros((n_classes, n_pairs, 2), device=self.device)
+        covs = torch.zeros((n_classes, n_pairs, 2, 2), device=self.device)
+
+        # Process each class
+        for class_idx, class_id in enumerate(unique_classes):
+            class_mask = (labels == class_id)
+            class_data = dataset[class_mask]
+
+            # Process each feature pair
+            for pair_idx, pair in enumerate(self.feature_pairs):
+                pair_data = class_data[:, pair]
+
+                # Compute mean efficiently
+                means[class_idx, pair_idx] = torch.mean(pair_data, dim=0)
+
+                # Compute covariance with stability check
+                if len(pair_data) > 1:
+                    centered_data = pair_data - means[class_idx, pair_idx].unsqueeze(0)
+                    cov = torch.matmul(centered_data.T, centered_data) / (len(pair_data) - 1)
+
+                    # Add stability term
+                    min_eig = torch.linalg.eigvals(cov).real.min()
+                    if min_eig < 1e-6:
+                        reg_term = (1e-6 - min_eig) + 1e-6
+                        cov += torch.eye(2, device=self.device) * reg_term
+                else:
+                    # Single sample case - use identity matrix
+                    cov = torch.eye(2, device=self.device)
+
+                covs[class_idx, pair_idx] = cov
+
+        return {
+            'means': means,
+            'covs': covs,
+            'classes': unique_classes,
+            'feature_pairs': self.feature_pairs
+        }
+
+    def _compute_batch_posterior_std(self, features: torch.Tensor, epsilon: float = 1e-10):
+        """Gaussian posterior computation focusing on relative class probabilities"""
+        features = features.to(self.device)
+        batch_size = len(features)
+        n_classes = len(self.likelihood_params['classes'])
+
+        # Initialize log likelihoods
+        log_likelihoods = torch.zeros((batch_size, n_classes), device=self.device)
+
+        # Process each feature pair
+        for pair_idx, pair in enumerate(self.feature_pairs):
+            pair_data = features[:, pair]
+
+            # Get weights for this pair (same as histogram mode)
+            pair_weights = [
+                self.weight_updater.get_gaussian_weights(class_idx, pair_idx)
+                for class_idx in range(n_classes)
+            ]
+
+            # Compute class contributions for this pair
+            for class_idx in range(n_classes):
+                mean = self.likelihood_params['means'][class_idx, pair_idx]
+                cov = self.likelihood_params['covs'][class_idx, pair_idx]
+                weight = pair_weights[class_idx]
+
+                # Center the data
+                centered = pair_data - mean.unsqueeze(0)
+
+                # Compute class likelihood
+                try:
+                    # Add minimal regularization
+                    reg_cov = cov + torch.eye(2, device=self.device) * 1e-6
+                    prec = torch.inverse(reg_cov)
+
+                    # Quadratic term
+                    quad = torch.sum(
+                        torch.matmul(centered.unsqueeze(1), prec).squeeze(1) * centered,
+                        dim=1
+                    )
+
+                    # Log likelihood (excluding constant terms that are same for all classes)
+                    class_ll = -0.5 * quad + torch.log(weight + epsilon)
+
+                except RuntimeError:
+                    # Handle numerical issues by setting very low likelihood
+                    class_ll = torch.full_like(quad, -1e10)
+
+                log_likelihoods[:, class_idx] += class_ll
+
+        # Convert to probabilities using softmax
+        max_log_ll = torch.max(log_likelihoods, dim=1, keepdim=True)[0]
+        exp_ll = torch.exp(log_likelihoods - max_log_ll)
+        posteriors = exp_ll / (torch.sum(exp_ll, dim=1, keepdim=True) + epsilon)
+
+        return posteriors, None
+
+    def _initialize_bin_weights(self):
+        """Initialize weights for either histogram bins or Gaussian components"""
+        n_classes = len(self.label_encoder.classes_)
+        if modelType == "Histogram":
+            self.weight_updater = BinWeightUpdater(
+                n_classes=n_classes,
+                feature_pairs=self.feature_pairs,
+                n_bins_per_dim=self.n_bins_per_dim
+            )
+        elif modelType == "Gaussian":
+            # Use same weight structure but for Gaussian components
+            self.weight_updater = BinWeightUpdater(
+                n_classes=n_classes,
+                feature_pairs=self.feature_pairs,
+                n_bins_per_dim=self.n_bins_per_dim  # Number of Gaussian components
+            )
+    def _update_priors_parallel(self, failed_cases: List[Tuple], batch_size: int = 32):
+        """Vectorized weight updates"""
+        n_failed = len(failed_cases)
+        if n_failed == 0:
+            self.consecutive_successes += 1
+            return
+
+        self.consecutive_successes = 0
+        self.learning_rate = max(self.learning_rate / 2, 1e-6)
+
+        # Stack all features and convert classes at once
+        features = torch.stack([case[0] for case in failed_cases]).to(self.device)
+        true_classes = torch.tensor([int(case[1]) for case in failed_cases], device=self.device)
+
+        # Compute posteriors for all cases at once
+        posteriors, bin_indices = self._compute_batch_posterior(features)
+        pred_classes = torch.argmax(posteriors, dim=1)
+
+        # Compute adjustments for all cases at once
+        true_posteriors = posteriors[torch.arange(n_failed), true_classes]
+        pred_posteriors = posteriors[torch.arange(n_failed), pred_classes]
+        adjustments = self.learning_rate * (1.0 - (true_posteriors / pred_posteriors))
+
+        # Update weights for each feature group
+        for group_idx in bin_indices:
+            bin_i, bin_j = bin_indices[group_idx]
+
+            # Group updates by class for vectorization
+            for class_id in range(self.weight_updater.n_classes):
+                class_mask = true_classes == class_id
+                if not class_mask.any():
+                    continue
+
+                # Get relevant indices and adjustments for this class
+                class_bin_i = bin_i[class_mask]
+                class_bin_j = bin_j[class_mask]
+                class_adjustments = adjustments[class_mask]
+
+                # Update weights for this class individually to avoid broadcasting issues
+                weights = self.weight_updater.histogram_weights[class_id][group_idx]
+                for idx in range(len(class_adjustments)):
+                    i, j = class_bin_i[idx], class_bin_j[idx]
+                    weights[i, j] += class_adjustments[idx]
+#------------------------------------------Boost weights------------------------------------------
+    def _update_weights_with_boosting(self, failed_cases: List[Tuple], batch_size: int = 32):
+        """
+        Update weights using difference boosting for failed cases.
+        Enhances the probability of misclassified examples by focusing on their error margins.
+        """
+        n_failed = len(failed_cases)
+        if n_failed == 0:
+            return
+
+        # Pre-allocate tensors on device
+        features = torch.stack([case[0] for case in failed_cases]).to(self.device)
+        true_classes = torch.tensor([case[1] for case in failed_cases], device=self.device)
+
+        # Compute posteriors for failed cases
+        posteriors = self._compute_batch_posterior(features)
+
+        # Get probability differences between true class and highest wrong class
+        batch_range = torch.arange(n_failed, device=self.device)
+        true_probs = posteriors[batch_range, true_classes]
+
+        # Create mask for non-true classes
+        mask = torch.ones_like(posteriors, dtype=torch.bool)
+        mask[batch_range, true_classes] = False
+        wrong_probs = posteriors.masked_fill(~mask, float('-inf')).max(dim=1)[0]
+
+        # Compute boosting factors based on probability differences
+        prob_differences = wrong_probs - true_probs
+        boost_factors = torch.exp(prob_differences / self.learning_rate)
+
+        # Update weights for each failed case
+        for i, class_id in enumerate(true_classes):
+            # Apply boosting to feature weights for the true class
+            self.current_W[class_id] *= boost_factors[i]
+
+        # Normalize weights to prevent numerical instability
+        self.current_W /= self.current_W.max()
+        self.current_W.clamp_(min=1e-10)
+
+    def _compute_custom_bin_edges(self, data: torch.Tensor, bin_sizes: List[int]) -> List[torch.Tensor]:
+        """
+        Compute bin edges based on custom bin sizes.
+        Supports both uniform and non-uniform binning.
+
+        Args:
+            data: Input tensor of shape [n_samples, n_features]
+            bin_sizes: List of integers specifying bin sizes for each dimension
+
+        Returns:
+            List of tensors containing bin edges for each dimension
+        """
+        n_dims = data.shape[1]
+        bin_edges = []
+
+        # If single bin size provided, use it for all dimensions
+        if len(bin_sizes) == 1:
+            bin_sizes = bin_sizes * n_dims
+
+        # Ensure we have enough bin sizes
+        if len(bin_sizes) < n_dims:
+            raise ValueError(f"Not enough bin sizes provided. Need {n_dims}, got {len(bin_sizes)}")
+
+        for dim in range(n_dims):
+            dim_data = data[:, dim]
+            dim_min, dim_max = dim_data.min(), dim_data.max()
+            padding = (dim_max - dim_min) * 0.01
+
+            # Create edges based on specified bin size
+            if bin_sizes[dim] <= 1:
+                raise ValueError(f"Bin size must be > 1, got {bin_sizes[dim]}")
+
+            edges = torch.linspace(
+                dim_min - padding,
+                dim_max + padding,
+                bin_sizes[dim] + 1,
+                device=self.device
+            )
+            bin_edges.append(edges)
+
+        return bin_edges
+
+    def _compute_pairwise_likelihood_parallel_exp(self, dataset: torch.Tensor, labels: torch.Tensor, feature_dims: int):
+        """
+        Modified likelihood computation to support custom bin sizes
+        """
+        dataset = torch.as_tensor(dataset, device=self.device).contiguous()
+        labels = torch.as_tensor(labels, device=self.device).contiguous()
+
+        unique_classes, class_counts = torch.unique(labels, return_counts=True)
+        n_classes = len(unique_classes)
+
+        # Get bin sizes from config
+        bin_sizes = self.config.get('likelihood_config', {}).get('bin_sizes', [20])
+
+        # Generate feature combinations
         self.feature_pairs = self._generate_feature_combinations(
             feature_dims,
             self.config.get('likelihood_config', {}).get('feature_group_size', 2),
@@ -695,67 +1729,38 @@ class GPUDBNN:
         all_bin_counts = []
         all_bin_probs = []
 
-        # Process each feature group with minimal memory allocation
+        # Process each feature group
         for feature_group in self.feature_pairs:
             feature_group = [int(x) for x in feature_group]
-
-            # Extract group data efficiently
             group_data = dataset[:, feature_group].contiguous()
-            n_dims = len(feature_group)
 
-            # Compute bin edges for all dimensions at once
-            bin_edges = []
-            for dim in range(n_dims):
-                dim_data = group_data[:, dim].contiguous()
-                dim_min, dim_max = dim_data.min(), dim_data.max()
+            # Use custom binning
+            bin_edges = self._compute_custom_bin_edges(group_data, bin_sizes)
 
-                # Add padding efficiently
-                padding = (dim_max - dim_min) * 0.01
-                edges = torch.linspace(
-                    dim_min - padding,
-                    dim_max + padding,
-                    n_bins_per_dim + 1,
-                    device=self.device
-                ).contiguous()
-                bin_edges.append(edges)
-
-            # Initialize bin counts with optimal memory layout
-            bin_shape = [n_classes] + [n_bins_per_dim] * n_dims
+            # Initialize bin counts
+            bin_shape = [n_classes] + [len(edges) - 1 for edges in bin_edges]
             bin_counts = torch.zeros(bin_shape, device=self.device, dtype=torch.float32)
 
-            # Process each class with optimized tensor operations
+            # Process each class
             for class_idx, class_label in enumerate(unique_classes):
                 class_mask = labels == class_label
                 if class_mask.any():
-                    class_data = group_data[class_mask].contiguous()
+                    class_data = group_data[class_mask]
 
-                    if n_dims == 2:  # Optimized path for pairs
-                        # Compute bin indices for both dimensions at once
-                        bin_indices = torch.stack([
-                            torch.bucketize(class_data[:, dim].contiguous(), bin_edges[dim].contiguous()) - 1
-                            for dim in range(2)
-                        ]).clamp_(0, n_bins_per_dim - 1)
+                    # Compute bin indices
+                    bin_indices = torch.stack([
+                        torch.bucketize(class_data[:, dim], bin_edges[dim]) - 1
+                        for dim in range(len(feature_group))
+                    ]).clamp_(0, bin_shape[1] - 1)
 
-                        # Use scatter_add_ for efficient counting
-                        counts = torch.zeros(n_bins_per_dim * n_bins_per_dim, device=self.device)
-                        flat_indices = bin_indices[0] * n_bins_per_dim + bin_indices[1]
-                        counts.scatter_add_(0, flat_indices, torch.ones_like(flat_indices, dtype=torch.float32))
-                        bin_counts[class_idx] = counts.reshape(n_bins_per_dim, n_bins_per_dim)
-                    else:
-                        # General case optimization
-                        bin_indices = torch.stack([
-                            torch.bucketize(class_data[:, dim].contiguous(), bin_edges[dim].contiguous()) - 1
-                            for dim in range(n_dims)
-                        ]).clamp_(0, n_bins_per_dim - 1)
+                    # Update bin counts
+                    for sample_idx in range(len(class_data)):
+                        idx = tuple([class_idx] + [bin_indices[d, sample_idx] for d in range(len(feature_group))])
+                        bin_counts[idx] += 1
 
-                        # Use tensor operations for multi-dimensional binning
-                        for sample_idx in range(len(class_data)):
-                            idx = tuple([class_idx] + [bin_indices[d, sample_idx] for d in range(n_dims)])
-                            bin_counts[idx] += 1
-
-            # Apply Laplace smoothing and compute probabilities efficiently
+            # Apply Laplace smoothing and compute probabilities
             smoothed_counts = bin_counts + 1.0
-            bin_probs = smoothed_counts / smoothed_counts.sum(dim=tuple(range(1, n_dims + 1)), keepdim=True)
+            bin_probs = smoothed_counts / smoothed_counts.sum(dim=tuple(range(1, len(feature_group) + 1)), keepdim=True)
 
             # Store results
             all_bin_edges.append(bin_edges)
@@ -770,255 +1775,6 @@ class GPUDBNN:
             'classes': unique_classes
         }
 
-    def _compute_batch_posterior(self, features: torch.Tensor, epsilon: float = 1e-10):
-        """
-        Optimized computation of posterior probabilities using pre-computed bin probabilities.
-        Uses efficient tensor operations and minimizes memory allocations.
-        """
-        batch_size = features.shape[0]
-        n_classes = len(self.likelihood_params['classes'])
-
-        # Pre-allocate output tensor
-        log_likelihoods = torch.zeros((batch_size, n_classes), device=self.device)
-
-        # Process feature groups efficiently
-        for group_idx, feature_group in enumerate(self.likelihood_params['feature_pairs']):
-            bin_edges = self.likelihood_params['bin_edges'][group_idx]
-            bin_probs = self.likelihood_params['bin_probs'][group_idx]
-
-            # Extract and make group data contiguous in one operation
-            group_data = features[:, feature_group].contiguous()
-            n_dims = len(feature_group)
-
-            # Pre-allocate indices tensor
-            indices = torch.empty((n_dims, batch_size), dtype=torch.long, device=self.device)
-
-            # Compute bin indices efficiently
-            for dim in range(n_dims):
-                indices[dim] = torch.bucketize(
-                    group_data[:, dim].contiguous(),
-                    bin_edges[dim].contiguous()
-                ).sub_(1).clamp_(0, bin_probs.shape[1] - 1)
-
-            # Efficient lookup based on dimensionality
-            if n_dims == 2:
-                # Optimize for common case of pairs
-                flat_indices = indices[0] * bin_probs.shape[1] + indices[1]
-                flat_bin_probs = bin_probs.reshape(n_classes, -1)
-                group_probs = flat_bin_probs[:, flat_indices]
-                group_log_likelihoods = torch.log(group_probs + epsilon).T
-            else:
-                # General case optimization
-                group_log_likelihoods = torch.empty((batch_size, n_classes), device=self.device)
-                for class_idx in range(n_classes):
-                    probs = bin_probs[class_idx][tuple(indices)]
-                    group_log_likelihoods[:, class_idx] = torch.log(probs + epsilon)
-
-            # Apply feature weights efficiently
-            if hasattr(self, 'current_W'):
-                group_weights = self.current_W[:, group_idx]
-                group_log_likelihoods.add_(torch.log(group_weights + epsilon).unsqueeze(0))
-
-            # Accumulate log likelihoods
-            log_likelihoods.add_(group_log_likelihoods)
-
-        # Compute posteriors using numerically stable operations
-        max_log_likelihood = log_likelihoods.max(dim=1, keepdim=True)[0]
-        likelihoods = torch.exp(log_likelihoods.sub_(max_log_likelihood))
-        posteriors = likelihoods.div_(likelihoods.sum(dim=1, keepdim=True) + epsilon)
-
-        return posteriors
-#----------------------------------------------------------------------------------------------------------------------------------------------------------------------
-    def _compute_pairwise_likelihood_parallel_std(self, dataset: torch.Tensor, labels: torch.Tensor, feature_dims: int):
-        """Compute likelihood parameters using rounded feature groups"""
-        # Round dataset according to cardinality_tolerance
-        if cardinality_tolerance != -1:
-            dataset = torch.round(dataset * 10**cardinality_tolerance) / 10**cardinality_tolerance
-
-        dataset = dataset.to(self.device)
-        labels = labels.to(self.device)
-
-        # Match C++ code dimensions
-        group_size = self.config.get('likelihood_config', {}).get('feature_group_size', 2)
-        max_combinations = self.config.get('likelihood_config', {}).get('max_combinations', None)
-
-        self.feature_pairs = self._generate_feature_combinations(
-            feature_dims,
-            group_size,
-            max_combinations
-        )
-
-        unique_classes = torch.unique(labels)
-        n_combinations = len(self.feature_pairs)
-        n_classes = len(unique_classes)
-
-        # Initialize with same dimensions as C++ code
-        means = torch.zeros((n_classes, n_combinations, group_size), device=self.device)
-        covs = torch.zeros((n_classes, n_combinations, group_size, group_size), device=self.device)
-
-        # Process each class separately like C++ code
-        for class_idx, class_id in enumerate(unique_classes):
-            class_mask = (labels == class_id)
-            class_data = dataset[class_mask]
-
-            # Group data using rounded values
-            group_data = torch.stack([
-                class_data[:, pair] for pair in self.feature_pairs
-            ], dim=1)
-
-            # Compute means using rounded data
-            means[class_idx] = torch.mean(group_data, dim=0)
-
-            # Compute covariances using rounded data
-            centered_data = group_data - means[class_idx].unsqueeze(0)
-            for i in range(n_combinations):
-                covs[class_idx, i] = torch.mm(
-                    centered_data[:, i].T,
-                    centered_data[:, i]
-                ) / (len(class_data) - 1)
-
-        # Add stability term as in C++ code
-        covs += torch.eye(group_size, device=self.device).unsqueeze(0).unsqueeze(0) * 1e-6
-
-        return {
-            'means': means,
-            'covs': covs,
-            'classes': unique_classes
-        }
-
-    def _compute_batch_posterior_std(self, features: torch.Tensor, epsilon: float = 1e-10):
-        """
-        Compute posterior probabilities for a batch of samples using feature groups.
-        Optimized version using parallel computation and vectorized operations.
-        """
-
-        # Ensure input features are contiguous
-        features = torch.as_tensor(features, device=self.device).contiguous()
-
-        batch_size = features.shape[0]
-        n_classes = len(self.likelihood_params['classes'])
-        group_size = self.feature_pairs.shape[1]
-
-        # Extract groups for the batch - shape: [batch_size, n_combinations, group_size]
-        batch_groups = torch.stack([
-            features[:, self.feature_pairs[i]] for i in range(len(self.feature_pairs))
-        ], dim=1)
-
-        # Reshape means to [n_classes, n_combinations, group_size]
-        means = torch.stack([self.likelihood_params['means'][c] for c in range(n_classes)])
-
-        # Reshape covs to [n_classes, n_combinations, group_size, group_size]
-        covs = torch.stack([self.likelihood_params['covs'][c] for c in range(n_classes)])
-
-        # Compute inverse covariance matrices for all classes at once
-        inv_covs = torch.inverse(covs)
-
-        # Compute log determinants for all classes at once - shape: [n_classes, n_combinations]
-        log_dets = torch.logdet(covs)
-
-        # Initialize log likelihoods
-        log_likelihoods = torch.zeros((batch_size, n_classes), device=self.device)
-
-        # Expand batch_groups to [batch_size, n_classes, n_combinations, group_size]
-        expanded_groups = batch_groups.unsqueeze(1).expand(-1, n_classes, -1, -1)
-
-        # Expand means to match batch_groups shape
-        expanded_means = means.unsqueeze(0).expand(batch_size, -1, -1, -1)
-
-        # Compute centered data for all classes at once
-        centered = expanded_groups - expanded_means
-
-        # Reshape centered for batch matrix multiplication
-        # [batch_size, n_classes, n_combinations, 1, group_size]
-        centered_reshaped = centered.unsqueeze(-2)
-
-        # Expand inv_covs to match batch size
-        # [batch_size, n_classes, n_combinations, group_size, group_size]
-        expanded_inv_covs = inv_covs.unsqueeze(0).expand(batch_size, -1, -1, -1, -1)
-
-        # Compute quadratic form for all samples, classes, and groups at once
-        # Shape: [batch_size, n_classes, n_combinations]
-        quad_form = torch.matmul(
-            torch.matmul(centered_reshaped, expanded_inv_covs),
-            centered.unsqueeze(-1)
-        ).squeeze(-1).squeeze(-1)
-
-        # Compute log likelihood for all groups
-        # Shape: [batch_size, n_classes, n_combinations]
-        pair_log_likelihood = -0.5 * (
-            group_size * np.log(2 * np.pi) +
-            log_dets.unsqueeze(0) +
-            quad_form
-        )
-
-        # Add prior weights (expanded to match shape)
-        # Shape: [batch_size, n_classes, n_combinations]
-        expanded_priors = self.current_W.unsqueeze(0).expand(batch_size, -1, -1)
-        weighted_likelihood = pair_log_likelihood + torch.log(expanded_priors + epsilon)
-
-        # Sum over groups for each sample and class
-        # Shape: [batch_size, n_classes]
-        log_likelihoods = weighted_likelihood.sum(dim=2)
-
-        # Compute posteriors using log-sum-exp trick
-        max_log_likelihood = torch.max(log_likelihoods, dim=1, keepdim=True)[0]
-        likelihoods = torch.exp(log_likelihoods - max_log_likelihood)
-        posteriors = likelihoods / (likelihoods.sum(dim=1, keepdim=True) + epsilon)
-
-        return posteriors
-
-    def _update_priors_parallel(self, failed_cases: List[Tuple], batch_size: int = 32):
-        """
-        Update priors for failed cases, maintaining individual example weights.
-        Only adds adjustments without upper limits.
-
-        Args:
-            failed_cases: List of (feature, true_class) tuples
-            batch_size: Size of batches for parallel processing
-        """
-        n_failed = len(failed_cases)
-        if n_failed == 0:
-            self.consecutive_successes = getattr(self, 'consecutive_successes', 0) + 1
-            if self.consecutive_successes >= 3:
-                self.learning_rate = min(self.learning_rate * 2, 1.0)
-                self.consecutive_successes = 0
-            return
-
-        # Reset consecutive successes and decrease learning rate on failure
-        self.consecutive_successes = 0
-        self.learning_rate = max(self.learning_rate / 2, 1e-6)
-
-        # Pre-allocate tensors on device
-        features = torch.stack([case[0] for case in failed_cases]).to(self.device)
-        true_classes = torch.tensor([case[1] for case in failed_cases], device=self.device)
-
-        # Compute posteriors based on model type
-        if modelType == "Histogram":
-            posteriors = self._compute_batch_posterior(features)
-        elif modelType == "Gaussian":
-            posteriors = self._compute_batch_posterior_std(features)
-        else:
-            raise ValueError(f"{modelType} is invalid. Please edit configuration file")
-
-        # Get the posterior probability for true class and max probability of other classes
-        batch_range = torch.arange(n_failed, device=self.device)
-        true_probs = posteriors[batch_range, true_classes]
-
-        # Create mask to get max probability among non-true classes
-        mask = torch.ones_like(posteriors, dtype=torch.bool)
-        mask[batch_range, true_classes] = False
-        max_other_probs = posteriors.masked_fill(~mask, float('-inf')).max(dim=1)[0]
-
-        # Compute adjustments (only positive additions)
-        adjustments = self.learning_rate * (1 - true_probs/max_other_probs)
-
-        # For each failed case, update its weight by adding the adjustment
-        # No upper limit imposed on weights
-        for i, class_id in enumerate(true_classes):
-            self.current_W[class_id] += adjustments[i]
-
-        # Ensure weights stay above minimum threshold
-        self.current_W.clamp_(min=1e-10)
 #---------------------------------------------------------Save Last data -------------------------
     def save_last_split(self, train_indices: list, test_indices: list):
         """Save the last training/testing split to CSV files"""
@@ -1080,15 +1836,13 @@ class GPUDBNN:
             for i in range(0, len(X), batch_size):
                 batch_X = X[i:min(i + batch_size, len(X))]
                 if modelType=="Histogram":
-
-                    # Compute posteriors for all cases at once
-                    posteriors = self._compute_batch_posterior(batch_X)  # Shape: [n_failed, n_classes]
+                    # Get posteriors only, ignore bin indices
+                    posteriors, _ = self._compute_batch_posterior(batch_X)
                 elif modelType=="Gaussian":
-
-                    # Compute posteriors for all cases at once
-                    posteriors = self._compute_batch_posterior_std(batch_X)  # Shape: [n_failed, n_classes]
+                    # Get posteriors only, ignore component responsibilities
+                    posteriors, _ = self._compute_batch_posterior_std(batch_X)
                 else:
-                    print(f"{modelType} is invalid. Please edit configutation file")
+                    print(f"{modelType} is invalid. Please edit configuration file")
 
                 batch_predictions = torch.argmax(posteriors, dim=1)
                 predictions.append(batch_predictions)
@@ -1210,6 +1964,10 @@ class GPUDBNN:
             X_test = torch.as_tensor(X_test).to(self.device)
             y_test = torch.as_tensor(y_test).to(self.device)
 
+        # Initialize bin-specific weights if not loaded
+        if self.weight_updater is None:
+            self._initialize_bin_weights()
+
         # Load previous best error if exists
         previous_best_error = float('inf')
         if hasattr(self, 'best_error'):
@@ -1273,9 +2031,9 @@ class GPUDBNN:
 
                 # Compute posteriors for batch
                 if modelType == "Histogram":
-                    posteriors = self._compute_batch_posterior(batch_X)
+                    posteriors, bin_indices = self._compute_batch_posterior(batch_X)
                 elif modelType == "Gaussian":
-                    posteriors = self._compute_batch_posterior_std(batch_X)
+                    posteriors, comp_resp = self._compute_batch_posterior_std(batch_X)
 
                 predictions[:current_batch_size] = torch.argmax(posteriors, dim=1)
                 batch_mask[:current_batch_size] = (predictions[:current_batch_size] != batch_y)
@@ -1401,83 +2159,148 @@ class GPUDBNN:
 
         plt.close()
 
-    def save_predictions(self, X: pd.DataFrame, predictions: torch.Tensor, output_file: str, true_labels: pd.Series = None):
+    def verify_classifications(self, X: pd.DataFrame, true_labels: pd.Series, predictions: torch.Tensor) -> None:
         """
-        Save predictions along with input data and probabilities to a CSV file and generate visualization plots
+        Verify classification accuracy computation
+
         Args:
-            X: Input DataFrame
-            predictions: Model predictions
-            output_file: Path to save the CSV file
-            true_labels: Ground truth labels if available
+            X: Input features DataFrame
+            true_labels: True labels Series
+            predictions: Model predictions tensor
         """
-        # Move tensors to CPU for numpy operations
+        # Convert predictions to same format as true labels
+        pred_labels = self.label_encoder.inverse_transform(predictions.cpu().numpy())
+
+        # Detailed counts
+        n_total = len(true_labels)
+        correct_mask = (true_labels == pred_labels)
+        n_correct = correct_mask.sum()
+
+        # Per-class analysis
+        unique_classes = true_labels.unique()
+        print("\nDetailed Classification Analysis:")
+        print(f"Total samples: {n_total}")
+        print(f"Correctly classified: {n_correct}")
+        print(f"Incorrectly classified: {n_total - n_correct}")
+        print(f"Raw accuracy: {n_correct/n_total:.4f}\n")
+
+        # Save misclassification details to file
+        analysis_file = f"classification_analysis_{self.dataset_name}.txt"
+        with open(analysis_file, 'w') as f:
+            f.write("Per-class breakdown:\n")
+            for cls in unique_classes:
+                cls_mask = (true_labels == cls)
+                n_cls = cls_mask.sum()
+                n_correct_cls = (correct_mask & cls_mask).sum()
+                f.write(f"\nClass {cls}:\n")
+                f.write(f"Total samples: {n_cls}\n")
+                f.write(f"Correctly classified: {n_correct_cls}\n")
+                f.write(f"Class accuracy: {n_correct_cls/n_cls:.4f}\n")
+
+                # Show misclassification details
+                if n_cls - n_correct_cls > 0:
+                    misclassified_mask = (~correct_mask & cls_mask)
+                    mis_predictions = pd.Series(pred_labels[misclassified_mask])
+                    f.write("\nMisclassified as:\n")
+                    for idx, count in mis_predictions.value_counts().items():
+                        f.write(f"{idx}: {count}\n")
+
+                    # Save examples of misclassified instances
+                    f.write("\nSample misclassified instances:\n")
+                    misclassified_data = X[misclassified_mask].head()
+                    misclassified_true = true_labels[misclassified_mask].head()
+                    misclassified_pred = pd.Series(pred_labels)[misclassified_mask].head()
+                    for i in range(len(misclassified_data)):
+                        f.write(f"\nInstance {i+1}:\n")
+                        f.write(f"True class: {misclassified_true.iloc[i]}\n")
+                        f.write(f"Predicted class: {misclassified_pred.iloc[i]}\n")
+                        f.write("Feature values:\n")
+                        for col in misclassified_data.columns:
+                            f.write(f"{col}: {misclassified_data.iloc[i][col]}\n")
+
+        print(f"\nDetailed analysis saved to {analysis_file}")
+
+
+    def save_predictions(self, X: pd.DataFrame, predictions: torch.Tensor, output_file: str, true_labels: pd.Series = None):
+        """Save predictions along with input data, probabilities, and verification analysis"""
         predictions = predictions.cpu()
-        # Create result DataFrame with input data
         result_df = X.copy()
-        # Convert predictions to original class labels
         pred_labels = self.label_encoder.inverse_transform(predictions.numpy())
         result_df['predicted_class'] = pred_labels
-        # Add ground truth if available
+
         if true_labels is not None:
             result_df['true_class'] = true_labels
-        # Get the preprocessed features for probability computation
+
+        # Get preprocessed features for probability computation
         X_processed = self._preprocess_data(X, is_training=False)
         X_tensor = torch.FloatTensor(X_processed).to(self.device)
+
         # Compute probabilities in batches
         batch_size = 32
         all_probabilities = []
+
         for i in range(0, len(X_tensor), batch_size):
             batch_end = min(i + batch_size, len(X_tensor))
             batch_X = X_tensor[i:batch_end]
-            # Get probabilities for this batch
-            if modelType=="Histogram":
 
-                # Compute posteriors for all cases at once
-                batch_probs = self._compute_batch_posterior(batch_X)  # Shape: [n_failed, n_classes]
-            elif modelType=="Gaussian":
+            try:
+                if modelType == "Histogram":
+                    batch_probs, _ = self._compute_batch_posterior(batch_X)
+                elif modelType == "Gaussian":
+                    batch_probs, _ = self._compute_batch_posterior_std(batch_X)
+                else:
+                    raise ValueError(f"{modelType} is invalid")
 
-                # Compute posteriors for all cases at once
-                batch_probs = self._compute_batch_posterior_std(batch_X)  # Shape: [n_failed, n_classes]
-            else:
-                print(f"{modelType} is invalid. Please edit configutation file")
+                all_probabilities.append(batch_probs.cpu().numpy())
 
-            all_probabilities.append(batch_probs.cpu().numpy())
-        # Combine all batch probabilities
-        all_probabilities = np.vstack(all_probabilities)
+            except Exception as e:
+                print(f"Error computing probabilities for batch {i}: {str(e)}")
+                return None
+
+        if all_probabilities:
+            all_probabilities = np.vstack(all_probabilities)
+        else:
+            print("No probabilities were computed successfully")
+            return None
 
         # Add probability columns for each class
         for i, class_name in enumerate(self.label_encoder.classes_):
             result_df[f'prob_{class_name}'] = all_probabilities[:, i]
 
-        # Add maximum probability column
         result_df['max_probability'] = all_probabilities.max(axis=1)
 
-        # Get runner-up information
-        top2_indices = np.argsort(all_probabilities, axis=1)[:, -2:]
-        runner_up_indices = top2_indices[:, 0]  # Second highest probability
-        runner_up_classes = self.label_encoder.inverse_transform(runner_up_indices)
-        runner_up_probs = np.array([all_probabilities[i, idx] for i, idx in enumerate(runner_up_indices)])
-
-        # Add runner-up information to DataFrame
-        result_df['runner_up_class'] = runner_up_classes
-        result_df['runner_up_probability'] = runner_up_probs
-
         if true_labels is not None:
-            # Convert true labels to indices
+            # Verification analysis
+            print("\nVerifying classification accuracy:")
+            self.verify_classifications(X, true_labels, predictions)
+
+            # Print metrics for full dataset
+            print("\nFull Dataset Metrics:")
+            print(f"Total samples: {len(result_df)}")
+
+            # Calculate overall accuracy
+            accuracy = (result_df['predicted_class'] == result_df['true_class']).mean()
+            print(f"Overall accuracy: {accuracy:.4f}")
+
+            # Calculate class-wise accuracies
+            print("\nClass-wise accuracies:")
+            for class_name in self.label_encoder.classes_:
+                class_mask = result_df['true_class'] == class_name
+                class_accuracy = (result_df[class_mask]['predicted_class'] == class_name).mean()
+                class_samples = class_mask.sum()
+                print(f"Class {class_name}: {class_accuracy:.4f} ({class_samples} samples)")
+
+            # Confidence metrics
+            print("\nConfidence Metrics:")
             true_indices = self.label_encoder.transform(true_labels)
-            # Get the probabilities for true classes
             true_probs = all_probabilities[np.arange(len(true_indices)), true_indices]
-            # Check if true class has the highest probability
             max_prob_indices = np.argmax(all_probabilities, axis=1)
             correct_prediction = (true_indices == max_prob_indices)
 
-            # Add confidence-based pass/fail label
             n_classes = len(self.label_encoder.classes_)
             confidence_threshold = 1.0 / n_classes
-            # Get probability columns
             prob_columns = [f'prob_{class_label}' for class_label in self.label_encoder.classes_]
 
-            # Check if true class probability is highest AND exceeds threshold
             result_df['confidence_check'] = np.where(
                 (true_probs >= confidence_threshold) &
                 (true_probs == result_df[prob_columns].max(axis=1)) &
@@ -1486,22 +2309,14 @@ class GPUDBNN:
                 'Failed'
             )
 
-            # Print summary statistics
             n_failed = (result_df['confidence_check'] == 'Failed').sum()
-            print(f"\nConfidence Check Summary:")
+            print(f"Confidence Check Summary:")
             print(f"Total predictions: {len(result_df)}")
             print(f"Failed (true class prob <= {confidence_threshold:.3f} or not max prob): {n_failed}")
             print(f"Passed (true class prob > {confidence_threshold:.3f} and is max prob): {len(result_df) - n_failed}")
 
-            # Create confusion matrix
-            import matplotlib.pyplot as plt
-            import seaborn as sns
-            from sklearn.metrics import confusion_matrix
-
-            # Create confusion matrix
+            # Create and save confusion matrix
             cm = confusion_matrix(true_labels, pred_labels)
-
-            # Create confusion matrix plot
             plt.figure(figsize=(12, 10))
             sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
                        xticklabels=self.label_encoder.classes_,
@@ -1509,49 +2324,43 @@ class GPUDBNN:
             plt.title('Confusion Matrix')
             plt.xlabel('Predicted Label')
             plt.ylabel('True Label')
-
-            # Save confusion matrix plot
             confusion_matrix_file = output_file.rsplit('.', 1)[0] + '_confusion_matrix.png'
             plt.savefig(confusion_matrix_file, bbox_inches='tight')
             plt.close()
 
-            print(f"Saved confusion matrix plot to {confusion_matrix_file}")
-
-        # Create probability distribution plots
-        # Create a figure with two subplots
+        # Create and save probability distribution plots
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 12))
-
-        # Plot 1: Overall maximum probability distribution
         ax1.hist(result_df['max_probability'], bins=50, color='lightblue', edgecolor='black')
-        ax1.axvline(x=confidence_threshold, color='red', linestyle='--', label='Confidence Threshold')
+        if true_labels is not None:
+            ax1.axvline(x=confidence_threshold, color='red', linestyle='--', label='Confidence Threshold')
         ax1.set_title('Distribution of Maximum Prediction Probabilities')
         ax1.set_xlabel('Maximum Probability')
         ax1.set_ylabel('Count')
         ax1.legend()
 
-        # Plot 2: Distribution for each class
         for i, class_name in enumerate(self.label_encoder.classes_):
             prob_col = f'prob_{class_name}'
             ax2.hist(result_df[prob_col], bins=50, alpha=0.5, label=class_name)
 
-        ax2.axvline(x=confidence_threshold, color='red', linestyle='--', label='Confidence Threshold')
+        if true_labels is not None:
+            ax2.axvline(x=confidence_threshold, color='red', linestyle='--', label='Confidence Threshold')
         ax2.set_title('Distribution of Prediction Probabilities by Class')
         ax2.set_xlabel('Probability')
         ax2.set_ylabel('Count')
         ax2.legend()
 
         plt.tight_layout()
-
-        # Save the plots
         plot_file = output_file.rsplit('.', 1)[0] + '_probability_distributions.png'
         plt.savefig(plot_file)
         plt.close()
 
-        # Save to CSV
         result_df.to_csv(output_file, index=False)
-        print(f"Saved predictions with probabilities to {output_file}")
+        print(f"\nSaved predictions with probabilities to {output_file}")
+        if true_labels is not None:
+            print(f"Saved confusion matrix plot to {confusion_matrix_file}")
         print(f"Saved probability distribution plots to {plot_file}")
 
+        return result_df
 #------------------------------------------------------------End of PP code ---------------------------------------------------
     def _compute_pairwise_likelihood(self, dataset, labels, feature_dims):
         """Compute pairwise likelihood PDFs"""
@@ -1594,109 +2403,71 @@ class GPUDBNN:
 
 
 
+    def _remove_high_cardinality_columns(self, df: pd.DataFrame, threshold: float = 0.8) -> pd.DataFrame:
+        """Remove high cardinality columns and round features with detailed debugging"""
+        DEBUG.log(f" Starting high cardinality removal with threshold {threshold}")
+        DEBUG.log(f" Initial columns: {df.columns.tolist()}")
+
+        # Round all features first if cardinality_tolerance is not -1
+        if self.cardinality_tolerance != -1:
+            DEBUG.log(f" Rounding features with tolerance {self.cardinality_tolerance}")
+            df_rounded = self._round_features(df)
+        else:
+            df_rounded = df.copy()
+
+        df_filtered = df_rounded.copy()
+        columns_to_drop = []
+
+        for column in df.columns:
+            if column == self.target_column:
+                continue
+
+            # Use rounded data for cardinality check
+            unique_count = len(df_rounded[column].unique())
+            unique_ratio = unique_count / len(df)
+            DEBUG.log(f" Column {column}: {unique_count} unique values, ratio {unique_ratio:.4f}")
+
+            if unique_ratio > threshold:
+                columns_to_drop.append(column)
+                DEBUG.log(f" Marking {column} for removal (ratio {unique_ratio:.4f} > {threshold})")
+
+        if columns_to_drop:
+            DEBUG.log(f" Dropping columns: {columns_to_drop}")
+            df_filtered = df_filtered.drop(columns=columns_to_drop)
+
+        DEBUG.log(f" Columns after filtering: {df_filtered.columns.tolist()}")
+        DEBUG.log(f" Remaining features: {len(df_filtered.columns)}")
+
+        if len(df_filtered.columns) == 0:
+            print("[WARNING] All features were removed! Reverting to original features with warnings.")
+            return df.copy()
+
+        return df_filtered
+
     def _detect_categorical_columns(self, df: pd.DataFrame) -> List[str]:
-        """Detect categorical columns in the dataset"""
+        """Detect categorical columns with improved debugging"""
+        DEBUG.log(" Starting categorical column detection")
         categorical_columns = []
+
         for column in df.columns:
             if column != self.target_column:
-                if df[column].dtype == 'object' or df[column].dtype.name == 'category':
+                dtype = df[column].dtype
+                unique_count = len(df[column].unique())
+                DEBUG.log(f" Column {column}: dtype={dtype}, unique values={unique_count}")
+
+                if dtype == 'object' or dtype.name == 'category':
+                    DEBUG.log(f" Adding {column} as categorical (object/category type)")
                     categorical_columns.append(column)
-                elif df[column].dtype in ['int64', 'float64']:
-                    # Check if the number of unique values is small relative to the dataset size
-                    if len(df[column].unique()) < min(50, len(df) * 0.05):
+                elif dtype in ['int64', 'float64']:
+                    threshold = min(50, len(df) * 0.05)
+                    if unique_count < threshold:
+                        DEBUG.log(f" Adding {column} as categorical (numeric with few unique values: {unique_count} < {threshold})")
                         categorical_columns.append(column)
+                    else:
+                        DEBUG.log(f" Keeping {column} as numeric (unique values: {unique_count} >= {threshold})")
+
+        DEBUG.log(f" Detected categorical columns: {categorical_columns}")
         return categorical_columns
-
-
-
-    def _preprocess_data(self, X: pd.DataFrame, is_training: bool = True) -> torch.Tensor:
-        # Make a copy to avoid modifying original data
-        X = X.copy()
-
-        # Calculate cardinality threshold
-        cardinality_threshold = self._calculate_cardinality_threshold()
-
-        if is_training:
-            # Store original column names before any transformations
-            self.original_columns = X.columns.tolist()
-
-            # Remove high cardinality columns during training
-            X = self._remove_high_cardinality_columns(X, cardinality_threshold)
-            self.feature_columns = X.columns.tolist()
-
-            # Store high cardinality columns for future reference
-            self.high_cardinality_columns = list(set(self.original_columns) - set(self.feature_columns))
-        else:
-            # For prediction, ensure we have the same columns as training
-            if not hasattr(self, 'feature_columns'):
-                raise ValueError("Model has not been trained yet - feature columns not found")
-
-            # Remove known high cardinality columns
-            if hasattr(self, 'high_cardinality_columns'):
-                X = X.drop(columns=self.high_cardinality_columns, errors='ignore')
-
-            # Ensure all required columns are present
-            missing_cols = set(self.feature_columns) - set(X.columns)
-            if missing_cols:
-                raise ValueError(f"Missing required columns: {missing_cols}")
-
-            # Reorder columns to match training order
-            X = X[self.feature_columns]
-
-        # Handle categorical features
-        X_encoded = self._encode_categorical_features(X, is_training)
-
-        # Scale the features
-        try:
-            if is_training:
-                X_scaled = self.scaler.fit_transform(X_encoded)
-            else:
-                X_scaled = self.scaler.transform(X_encoded)
-        except Exception as e:
-            print(f"Warning: Scaling failed: {str(e)}. Using normalized data instead.")
-            # Fallback to basic normalization
-            X_scaled = (X_encoded - X_encoded.mean()) / (X_encoded.std() + 1e-8)
-
-        return torch.FloatTensor(X_scaled)
-
-
-
-
-    def _load_dataset(self) -> pd.DataFrame:
-        """Load and preprocess dataset"""
-        file_path = self.config['file_path']
-
-        try:
-            # Handle URL or local file
-            if file_path.startswith(('http://', 'https://')):
-                response = requests.get(file_path)
-                response.raise_for_status()
-                data = StringIO(response.text)
-            else:
-                data = file_path
-
-            # Read CSV with appropriate parameters
-            read_params = {
-                'sep': self.config['separator'],
-                'header': 0 if self.config['has_header'] else None,
-                'names': self.config.get('column_names'),
-            }
-
-            df = pd.read_csv(data, **read_params)
-
-            # Filter features based on config
-            df = _filter_features_from_config(df, self.config)
-
-            # Handle target column
-            if isinstance(self.config['target_column'], int):
-                # If target column is specified by index
-                cols = df.columns.tolist()
-                self.config['target_column'] = cols[self.config['target_column']]
-
-            return df
-
-        except Exception as e:
-            raise RuntimeError(f"Failed to load dataset: {str(e)}")
 
 
     def _multivariate_normal_pdf(self, x, mean, cov):
@@ -1922,19 +2693,58 @@ class GPUDBNN:
                 self.categorical_encoders = {}
 
     def _encode_categorical_features(self, df: pd.DataFrame, is_training: bool = True):
+        """Encode categorical features with proper dtype handling"""
+        DEBUG.log("Starting categorical encoding")
         df_encoded = df.copy()
         categorical_columns = self._detect_categorical_columns(df)
 
         for column in categorical_columns:
             if is_training:
                 if column not in self.categorical_encoders:
-                    unique_values = df[column].unique()
+                    # Create new encoder
+                    unique_values = df[column].fillna('MISSING').unique()
                     self.categorical_encoders[column] = {
                         value: idx for idx, value in enumerate(unique_values)
                     }
-            mapping = self.categorical_encoders[column]
-            df_encoded[column] = df[column].map(lambda x: mapping.get(x, -1))
 
+            if column not in self.categorical_encoders:
+                continue
+
+            # Get original dtype
+            original_dtype = df[column].dtype
+            mapping = self.categorical_encoders[column]
+
+            # Handle missing values and new categories
+            df_encoded[column] = df[column].fillna('MISSING').map(
+                lambda x: mapping.get(x, -1)
+            )
+
+            # Handle unmapped values
+            unmapped = df_encoded[df_encoded[column] == -1].index
+            if len(unmapped) > 0:
+                DEBUG.log(f"Found {len(unmapped)} unmapped values in column {column}")
+
+                # Calculate mean value
+                mapped_values = [v for v in mapping.values() if isinstance(v, (int, float))]
+                if mapped_values:
+                    mean_value = float(np.mean(mapped_values))
+
+                    # Convert to proper dtype
+                    if np.issubdtype(original_dtype, np.integer):
+                        mean_value = int(round(mean_value))
+
+                    # Update unmapped values
+                    df_encoded.loc[unmapped, column] = mean_value
+
+        # Verify no categorical columns remain
+        remaining_object_cols = df_encoded.select_dtypes(include=['object']).columns
+        if len(remaining_object_cols) > 0:
+            DEBUG.log(f"Remaining object columns after encoding: {remaining_object_cols}")
+            # Convert any remaining object columns to numeric
+            for col in remaining_object_cols:
+                df_encoded[col] = pd.to_numeric(df_encoded[col], errors='coerce').fillna(0)
+
+        DEBUG.log(f"Categorical encoding complete. Shape: {df_encoded.shape}")
         return df_encoded
 
 #--------------------------------------------------------------------------------------------------------------
@@ -1956,11 +2766,14 @@ class GPUDBNN:
             'high_cardinality_columns': getattr(self, 'high_cardinality_columns', []),
             'original_columns': getattr(self, 'original_columns', None),
             'best_error': self.best_error,  # Explicitly save best error
-            'last_training_loss': getattr(self, 'last_training_loss', float('inf'))
+            'last_training_loss': getattr(self, 'last_training_loss', float('inf')),
+            'weight_updater': self.weight_updater,
+            'n_bins_per_dim': self.n_bins_per_dim
         }
 
         # Get the filename using existing method
         components_file = self._get_model_components_filename()
+
 
         # Ensure directory exists
         os.makedirs(os.path.dirname(components_file), exist_ok=True)
@@ -1989,7 +2802,10 @@ class GPUDBNN:
                 self.categorical_encoders = components['categorical_encoders']
                 self.high_cardinality_columns = components.get('high_cardinality_columns', [])
                 print(f"Loaded model components from {components_file}")
+                self.weight_updater = components.get('weight_updater')
+                self.n_bins_per_dim = components.get('n_bins_per_dim', 20)
                 return True
+        return False
 
 
 
@@ -2151,14 +2967,39 @@ def generate_test_datasets():
         f.write('1,1,1,0\n')
 
 
+class DebugLogger:
+    def __init__(self):
+        self.enabled = False
+
+    def enable(self):
+        self.enabled = True
+
+    def disable(self):
+        self.enabled = False
+
+    def log(self, msg, force=False):
+        """Only print if enabled or forced"""
+        if self.enabled or force:
+            print(msg)
+
+# Create single global instance
+DEBUG = DebugLogger()
+
+def configure_debug(config):
+    """Configure debug state from config"""
+    debug_enabled = config.get('training_params', {}).get('debug_enabled', False)
+    if debug_enabled:
+        DEBUG.enable()
+    else:
+        DEBUG.disable()
+
 def load_global_config():
-    """Load global configuration parameters"""
+    """Load global configuration parameters with improved handling"""
     try:
         # First read the file as text and clean comments
         with open("adaptive_dbnn.conf", 'r') as f:
             lines = []
             for line in f:
-                # Remove everything after # in each line
                 clean_line = line.split('#')[0].strip()
                 if clean_line:  # Only keep non-empty lines
                     lines.append(clean_line)
@@ -2166,40 +3007,49 @@ def load_global_config():
         # Join the cleaned lines and parse as JSON
         config_str = ''.join(lines)
         config = json.loads(config_str)
+
         # Define globals
         global Trials, cardinality_threshold, cardinality_tolerance
-        global LearningRate, TrainingRandomSeed, Epochs, TestFraction,Fresh
-        global Train, Train_only, Predict, Gen_Samples, EnableAdaptive,nokbd,Train_device,modelType
+        global LearningRate, TrainingRandomSeed, Epochs, TestFraction, Fresh
+        global Train, Train_only, Predict, Gen_Samples, EnableAdaptive, nokbd
+        global Train_device, modelType, use_previous_model
 
         # Load training parameters
-        Trials = config['training_params']['trials']
-        cardinality_threshold = config['training_params']['cardinality_threshold']
-        cardinality_tolerance = config['training_params']['cardinality_tolerance']
-        LearningRate = config['training_params']['learning_rate']
-        TrainingRandomSeed = config['training_params']['random_seed']
-        Epochs = config['training_params']['epochs']
-        TestFraction = config['training_params']['test_fraction']
-        EnableAdaptive = config['training_params']['enable_adaptive']
-        usekbd =config['training_params']['use_interactive_kbd']
-        Train_device=config['training_params']['compute_device']
-        modelType=config['training_params']['modelType']
-        print(f"using model type: {modelType}")
+        training_params = config['training_params']
+        Trials = training_params['trials']
+        cardinality_threshold = training_params['cardinality_threshold']
+        cardinality_tolerance = training_params['cardinality_tolerance']
+        LearningRate = training_params['learning_rate']
+        TrainingRandomSeed = training_params['random_seed']
+        Epochs = training_params['epochs']
+        TestFraction = training_params['test_fraction']
+        EnableAdaptive = training_params['enable_adaptive']
+        usekbd = training_params['use_interactive_kbd']
+        Train_device = training_params['compute_device']
+        modelType = training_params['modelType']
+        DEBUG.log(f"Using model type: {modelType}")
+
         # Load execution flags
-        Train = config['execution_flags']['train']
-        Train_only = config['execution_flags']['train_only']
-        Predict = config['execution_flags']['predict']
-        Gen_Samples = config['execution_flags']['gen_samples']
-        Fresh = config['execution_flags']['fresh_start']
-        print(f"The fresh training is set to {Fresh}")
-        nokbd= not usekbd
-        if Train_device=='auto':
-            Train_device='cuda' if torch.cuda.is_available() else 'cpu'
-        print("Global configuration loaded successfully")
+        execution_flags = config['execution_flags']
+        Train = execution_flags['train']
+        Train_only = execution_flags['train_only']
+        Predict = execution_flags['predict']
+        Gen_Samples = execution_flags['gen_samples']
+        Fresh = execution_flags['fresh_start']
+        use_previous_model = execution_flags.get('use_previous_model', True)  # Default to True if not specified
+
+        DEBUG.log(f"Fresh training is set to: {Fresh}")
+        DEBUG.log(f"Use previous model is set to: {use_previous_model}")
+
+        nokbd = not usekbd
+        if Train_device == 'auto':
+            Train_device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
         print(f"System is set to work on {Train_device}")
         if nokbd:
             print("Interactive keys disabled")
 
-        return Fresh
+        return Fresh, use_previous_model  # Return both flags
 
     except Exception as e:
         print(f"Error loading configuration: {str(e)}")
@@ -2212,19 +3062,17 @@ def load_global_config():
         Train_only = False
         Predict = True
         Gen_Samples = False
-        EnableAdaptive = True  # Default value
+        EnableAdaptive = True
         nokbd = False
-        Train_device='cuda' if torch.cuda.is_available() else 'cpu'
-        modelType='Gaussian'
-        print("Using default values. Default model assumes Gaussian distribution. You can also use Histogram as modelType for nonparametric distributions.")
-        return False
-
-
-
+        Train_device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        modelType = 'Gaussian'
+        use_previous_model = True
+        print("Using default values")
+        return False, True
 
 if __name__ == "__main__":
     # Load configuration before class definition
-    fresh_start = load_global_config()
+    fresh_start, use_previous_model = load_global_config()
 
     if nokbd==False:
         print("Will attempt keyboard interaction...")
@@ -2278,7 +3126,10 @@ if __name__ == "__main__":
 
     if Gen_Samples:
         generate_test_datasets()
-    print(f"fresh start is {fresh_start}")
+
+    DEBUG.log(f"Fresh start: {fresh_start}")
+    DEBUG.log(f"Use previous model: {use_previous_model}")
+
     # Test datasets
     datasets_to_test = DatasetConfig.get_available_datasets()
     for dataset in datasets_to_test:
@@ -2289,7 +3140,8 @@ if __name__ == "__main__":
                 max_epochs=Epochs,
                 test_size=TestFraction,
                 random_state=TrainingRandomSeed,
-                fresh=fresh_start
+                fresh=fresh_start,
+                use_previous_model=use_previous_model  # Pass this flag
             )
 
             if Train:
@@ -2310,4 +3162,3 @@ if __name__ == "__main__":
 
         except Exception as e:
             print(f"Error processing {dataset}: {str(e)}")
-
