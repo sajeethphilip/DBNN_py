@@ -16,8 +16,8 @@ Let me break down the key components of this GPU-optimized Deep Bayesian Neural 
 
 {
 
-    "file_path": "cardiotocography.csv",
-    "target_column": "NSP",
+    "file_path": "cardiotocography.csv", # Also can be the URL like  "file_path": "https://archive.ics.uci.edu/static/public/193/data.csv",
+    "target_column": "NSP", # Also can give column_names if desired as "column_names":[...]
     "separator": ",",
     "has_header": true,
     "likelihood_config": {
