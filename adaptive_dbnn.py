@@ -1301,7 +1301,7 @@ class GPUDBNN:
                             improvement_threshold: float = 0.001,
                             load_epoch: int = None,
                             batch_size: int = 32):
-        """Modified adaptive training strategy selecting one sample from each failing class"""
+        """Modified adaptive training strategy with retry mechanism"""
         DEBUG.log(" Starting adaptive_fit_predict")
         if not EnableAdaptive:
             print("Adaptive learning is disabled. Using standard training.")
@@ -1435,12 +1435,42 @@ class GPUDBNN:
                 X_train = self.X_tensor[train_indices]
                 y_train = self.y_tensor[train_indices]
 
-                # Check training accuracy
-                train_predictions = self.predict(X_train, batch_size=batch_size)
-                train_accuracy = (train_predictions == y_train.cpu()).float().mean()
-                print(f"Training accuracy: {train_accuracy:.4f}")
+                # Initialize variables for retry mechanism
+                patience_counter = 0
+                best_train_accuracy = 0
+                patience = 5 if self.in_adaptive_fit else Trials
+                last_train_accuracy = 0
 
-                if train_accuracy == 1.0:
+                # Training retry loop - keep training with current samples until success or patience exhausted
+                while patience_counter < patience:
+                    # Train the model
+                    save_path = f"round_{round_num}_predictions.csv"
+                    self.train_indices = train_indices
+                    self.test_indices = test_indices
+                    results = self.fit_predict(batch_size=batch_size, save_path=save_path)
+
+                    # Check training accuracy
+                    train_predictions = self.predict(X_train, batch_size=batch_size)
+                    train_accuracy = (train_predictions == y_train.cpu()).float().mean()
+                    print(f"Training attempt accuracy: {train_accuracy:.4f}")
+
+                    if train_accuracy == 1.0:
+                        print("Achieved 100% training accuracy")
+                        break
+
+                    # Check if we're improving
+                    if train_accuracy > best_train_accuracy + improvement_threshold:
+                        best_train_accuracy = train_accuracy
+                        patience_counter = 0  # Reset patience if we improve
+                        print(f"Improved training accuracy to {train_accuracy:.4f}")
+                    else:
+                        patience_counter += 1
+                        print(f"No significant improvement. Patience: {patience_counter}/{patience}")
+
+                    last_train_accuracy = train_accuracy
+
+                # After training attempts, proceed based on outcome
+                if last_train_accuracy == 1.0:
                     if len(test_indices) == 0:
                         print("No more test samples available. Training complete.")
                         break
@@ -1450,7 +1480,13 @@ class GPUDBNN:
                     y_test = self.y_tensor[test_indices]
                     test_predictions = self.predict(X_test, batch_size=batch_size)
 
-                    # Get new training samples
+                    # Print confusion matrix and class-wise accuracy
+                    print(f"\n{Colors.BLUE}Test Set Performance - Round {round_num + 1}{Colors.ENDC}")
+                    y_test_cpu = y_test.cpu().numpy()
+                    test_predictions_cpu = test_predictions.cpu().numpy()
+                    self.print_colored_confusion_matrix(y_test_cpu, test_predictions_cpu)
+
+                    # Get new training samples from misclassified examples
                     new_train_indices = self._select_samples_from_failed_classes(
                         test_predictions, y_test, test_indices
                     )
@@ -1463,13 +1499,20 @@ class GPUDBNN:
                     test_indices = list(set(test_indices) - set(new_train_indices))
 
                 else:
-                    # Training failed to achieve 100% accuracy
-                    print("Training failed to achieve 100% accuracy, selecting new samples...")
+                    # Training failed to achieve 100% accuracy after all attempts
+                    print(f"Failed to achieve 100% accuracy after {patience} attempts.")
+                    print("Selecting new samples to augment training set...")
 
                     # Evaluate test data
                     X_test = self.X_tensor[test_indices]
                     y_test = self.y_tensor[test_indices]
                     test_predictions = self.predict(X_test, batch_size=batch_size)
+
+                    # Print confusion matrix and class-wise accuracy
+                    print(f"\n{Colors.BLUE}Test Set Performance - Round {round_num + 1}{Colors.ENDC}")
+                    y_test_cpu = y_test.cpu().numpy()
+                    test_predictions_cpu = test_predictions.cpu().numpy()
+                    self.print_colored_confusion_matrix(y_test_cpu, test_predictions_cpu)
 
                     # Select new samples from failing classes
                     new_train_indices = self._select_samples_from_failed_classes(
@@ -1480,12 +1523,9 @@ class GPUDBNN:
                         train_indices.extend(new_train_indices)
                         test_indices = list(set(test_indices) - set(new_train_indices))
                         print(f"Added {len(new_train_indices)} new samples to training set")
-
-                    # Train with updated sets
-                    save_path = f"round_{round_num}_predictions.csv"
-                    self.train_indices = train_indices
-                    self.test_indices = test_indices
-                    results = self.fit_predict(batch_size=batch_size, save_path=save_path)
+                    else:
+                        print("No suitable new samples found. Training complete.")
+                        break
 
                 # Save the current split
                 self.save_last_split(train_indices, test_indices)
