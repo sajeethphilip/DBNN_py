@@ -92,7 +92,6 @@ class Colors:
 class DatasetConfig:
     """Enhanced dataset configuration handling with support for column names and URLs"""
 
-class DatasetConfig:
     DEFAULT_CONFIG = {
         "file_path": None,
         "column_names": None,
@@ -141,29 +140,49 @@ class DatasetConfig:
 
         return True
 
-        @staticmethod
-        def create_default_config(dataset_name: str) -> Dict:
-            """Create a default configuration file with enhanced defaults"""
-            config = DatasetConfig.DEFAULT_CONFIG.copy()
-            config['file_path'] = f"{dataset_name}.csv"
+    @staticmethod
+    def create_default_config(dataset_name: str) -> Dict:
+        """Create a default configuration file with enhanced defaults"""
+        config = DatasetConfig.DEFAULT_CONFIG.copy()
+        config['file_path'] = f"{dataset_name}.csv"
 
-            # Try to infer column names from CSV if it exists
-            if os.path.exists(config['file_path']):
-                try:
-                    with open(config['file_path'], 'r') as f:
-                        header = f.readline().strip()
-                        config['column_names'] = header.split(config['separator'])
-                        if config['column_names']:
-                            config['target_column'] = config['column_names'][-1]
-                except:
-                    pass
+        # Try to infer column names from CSV if it exists
+        if os.path.exists(config['file_path']):
+            try:
+                with open(config['file_path'], 'r') as f:
+                    header = f.readline().strip()
+                    config['column_names'] = header.split(config['separator'])
+                    if config['column_names']:
+                        config['target_column'] = config['column_names'][-1]
+            except Exception as e:
+                print(f"Warning: Could not read header from {config['file_path']}: {str(e)}")
 
-            config_path = f"{dataset_name}.conf"
+        # Add model type configuration
+        config['modelType'] = "Histogram"  # Default to Histogram model
+
+        # Add training parameters
+        config['training_params'] = {
+            "trials": 100,
+            "cardinality_threshold": 0.9,
+            "cardinality_tolerance": 4,
+            "learning_rate": 0.1,
+            "random_seed": 42,
+            "epochs": 1000,
+            "test_fraction": 0.2,
+            "enable_adaptive": True,
+            "compute_device": "auto"
+        }
+
+        # Save the configuration
+        config_path = f"{dataset_name}.conf"
+        try:
             with open(config_path, 'w') as f:
                 json.dump(config, f, indent=4)
-
             print(f"Created default configuration file: {config_path}")
-            return config
+        except Exception as e:
+            print(f"Warning: Could not save configuration file: {str(e)}")
+
+        return config
 
 
 
@@ -190,7 +209,7 @@ class DatasetConfig:
 
     @staticmethod
     def load_config(dataset_name: str) -> Dict:
-        """Enhanced configuration loading with complete error handling and parameter validation"""
+        """Enhanced configuration loading with URL handling"""
         config_path = f"{dataset_name}.conf"
         try:
             # Check if configuration file exists
@@ -199,11 +218,10 @@ class DatasetConfig:
                 print(f"Creating default configuration for {dataset_name}")
                 return DatasetConfig.create_default_config(dataset_name)
 
-            # Read and parse configuration while preserving comments
+            # Read and parse configuration
             with open(config_path, 'r', encoding='utf-8') as f:
                 config_text = f.read()
 
-            # Remove comments and parse JSON
             def remove_comments(json_str):
                 lines = []
                 in_multiline_comment = False
@@ -220,8 +238,8 @@ class DatasetConfig:
                     elif in_multiline_comment:
                         continue
 
-                    # Remove single-line comments
-                    if '//' in line:
+                    # Remove single-line comments, but skip if // is part of http:// or https://
+                    if '//' in line and not ('http://' in line or 'https://' in line):
                         line = line.split('//')[0]
 
                     # Only add non-empty lines
@@ -239,32 +257,27 @@ class DatasetConfig:
                 print("Creating default configuration instead")
                 return DatasetConfig.create_default_config(dataset_name)
 
-            # Create validated config starting with defaults
+            # Validate and update configuration with defaults
             validated_config = DatasetConfig.DEFAULT_CONFIG.copy()
-
-            # Update with provided config while preserving nested structures
-            def deep_update(base_dict, update_dict):
-                for key, value in update_dict.items():
-                    if isinstance(value, dict) and key in base_dict and isinstance(base_dict[key], dict):
-                        deep_update(base_dict[key], value)
-                    else:
-                        base_dict[key] = value
-
-            deep_update(validated_config, config)
-
-            # Ensure active learning parameters are present with correct defaults
-            if 'active_learning' not in validated_config:
-                validated_config['active_learning'] = DatasetConfig.DEFAULT_CONFIG['active_learning'].copy()
-            else:
-                # Ensure all active learning parameters have defaults
-                default_active_learning = DatasetConfig.DEFAULT_CONFIG['active_learning']
-                for key, value in default_active_learning.items():
-                    if key not in validated_config['active_learning']:
-                        validated_config['active_learning'][key] = value
+            validated_config.update(config)
 
             # Check if file path exists
             if not validated_config.get('file_path'):
                 validated_config['file_path'] = f"{dataset_name}.csv"
+
+            # Handle URL in file_path
+            if DatasetConfig.is_url(validated_config['file_path']):
+                url = validated_config['file_path']
+                local_path = f"{dataset_name}.csv"
+
+                if not os.path.exists(local_path):
+                    print(f"Downloading dataset from {url}")
+                    if not DatasetConfig.download_dataset(url, local_path):
+                        print(f"Failed to download dataset from {url}")
+                        return None
+                    print(f"Downloaded dataset to {local_path}")
+
+                validated_config['file_path'] = local_path
 
             # Verify the data file exists
             if not os.path.exists(validated_config['file_path']):
@@ -272,11 +285,6 @@ class DatasetConfig:
                 if not DatasetConfig.is_url(validated_config['file_path']):
                     print(f"Neither local file nor URL found for {dataset_name}")
                     return None
-
-            # Print active learning configuration for verification
-            print(f"\nActive Learning Configuration:")
-            print(f"- Probability tolerance: {validated_config['active_learning']['tolerance']}%")
-            print(f"- Cardinality threshold percentile: {validated_config['active_learning']['cardinality_threshold_percentile']}%")
 
             return validated_config
 
@@ -287,16 +295,39 @@ class DatasetConfig:
 
     @staticmethod
     def download_dataset(url: str, local_path: str) -> bool:
-        """Download dataset from URL to local path"""
+        """Download dataset from URL to local path with proper error handling"""
         try:
-            response = requests.get(url)
-            response.raise_for_status()
-            with open(local_path, 'w') as f:
-                f.write(response.text)
+            print(f"Downloading dataset from {url}")
+            response = requests.get(url, timeout=30)  # Add timeout
+            response.raise_for_status()  # Check for HTTP errors
+
+            # Handle potential text/csv content
+            content = response.content.decode('utf-8')
+
+            # Save to local file
+            with open(local_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+
+            print(f"Dataset downloaded successfully to {local_path}")
             return True
-        except Exception as e:
+        except requests.exceptions.RequestException as e:
             print(f"Error downloading dataset: {str(e)}")
             return False
+        except UnicodeDecodeError:
+            # Handle binary content
+            try:
+                with open(local_path, 'wb') as f:
+                    f.write(response.content)
+                print(f"Dataset downloaded successfully to {local_path}")
+                return True
+            except Exception as e:
+                print(f"Error saving binary content: {str(e)}")
+                return False
+        except Exception as e:
+            print(f"Unexpected error downloading dataset: {str(e)}")
+            return False
+
+
 
     @staticmethod
     def get_available_datasets(create_configs: bool = False) -> List[str]:
@@ -1036,6 +1067,7 @@ class GPUDBNN:
             features = features.cuda(non_blocking=True)
 
         return features
+
     def _load_dataset(self) -> pd.DataFrame:
         """Load and preprocess dataset with improved error handling"""
         DEBUG.log(f" Loading dataset from config: {self.config}")
