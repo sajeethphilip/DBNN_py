@@ -1304,188 +1304,185 @@ class GPUDBNN:
 
     def _compute_sample_divergence(self, sample_data: torch.Tensor, feature_pairs: List[Tuple]) -> torch.Tensor:
         """
-        Compute pairwise feature divergence between samples using feature pairs.
+        Vectorized computation of pairwise feature divergence.
         """
         n_samples = sample_data.shape[0]
         if n_samples <= 1:
             return torch.zeros((1, 1), device=self.device)
 
-        # Compute distances using feature pairs
-        pair_distances = []
-        for pair in feature_pairs:
+        # Pre-allocate tensor for pair distances
+        pair_distances = torch.zeros((len(feature_pairs), n_samples, n_samples),
+                                   device=self.device)
+
+        # Compute distances for all pairs in one batch
+        for i, pair in enumerate(feature_pairs):
             pair_data = sample_data[:, pair]
+            # Vectorized pairwise difference computation
             diff = pair_data.unsqueeze(1) - pair_data.unsqueeze(0)
-            dist = torch.norm(diff, dim=2)
-            pair_distances.append(dist)
+            pair_distances[i] = torch.norm(diff, dim=2)
 
-        # Combine distances from all pairs
-        distances = torch.stack(pair_distances).mean(dim=0)
+        # Average across feature pairs
+        distances = torch.mean(pair_distances, dim=0)
 
-        # Normalize distances
+        # Normalize
         if distances.max() > 0:
-            distances = distances / distances.max()
+            distances /= distances.max()
 
         return distances
 
+    def _compute_feature_cardinalities(self, samples_data: torch.Tensor) -> torch.Tensor:
+        """
+        Vectorized computation of feature cardinalities.
+        """
+        cardinalities = torch.zeros(len(samples_data), device=self.device)
+
+        # Process feature pairs in batches
+        batch_size = 100  # Adjust based on memory constraints
+        for i in range(0, len(samples_data), batch_size):
+            batch_end = min(i + batch_size, len(samples_data))
+            batch_data = samples_data[i:batch_end]
+
+            # Compute cardinalities for each feature pair
+            batch_cardinalities = torch.zeros(batch_end - i, device=self.device)
+            for feat_pair in self.feature_pairs:
+                pair_data = batch_data[:, feat_pair]
+                # Compute unique values efficiently
+                _, counts = torch.unique(pair_data, dim=0, return_counts=True)
+                batch_cardinalities += len(counts)
+
+            cardinalities[i:batch_end] = batch_cardinalities
+
+        return cardinalities
 
     def _select_samples_from_failed_classes(self, test_predictions, y_test, test_indices):
         """
-        Select samples from each failing class, considering probability similarity,
-        feature cardinality, and feature diversity.
+        Optimized sample selection with vectorized operations.
         """
-        # Get active learning parameters from config
+        # Get config parameters
         active_learning_config = self.config.get('active_learning', {})
         tolerance = active_learning_config.get('tolerance', 1.0) / 100.0
         min_divergence = active_learning_config.get('min_divergence', 0.1)
 
-        # Convert tensors to CPU numpy arrays if needed
-        test_predictions = test_predictions.cpu() if torch.is_tensor(test_predictions) else test_predictions
-        y_test_cpu = y_test.cpu() if torch.is_tensor(y_test) else y_test
+        # Convert to tensors and move to device
+        test_predictions = torch.as_tensor(test_predictions, device=self.device)
+        y_test = torch.as_tensor(y_test, device=self.device)
+        test_indices = torch.as_tensor(test_indices, device=self.device)
 
-        # Find misclassified examples
-        misclassified_mask = (test_predictions != y_test_cpu)
-        misclassified_test_indices = [i for i, is_wrong in enumerate(misclassified_mask) if is_wrong]
+        # Find misclassified examples (vectorized)
+        misclassified_mask = (test_predictions != y_test)
+        misclassified_indices = torch.nonzero(misclassified_mask).squeeze()
 
-        if not misclassified_test_indices:
+        if len(misclassified_indices) == 0:
             return []
 
-        # Group misclassified examples by their true class
-        class_indices = defaultdict(list)
-        for idx in misclassified_test_indices:
-            true_class = y_test_cpu[idx].item()
-            class_indices[true_class].append((idx, test_indices[idx]))
-
-        # Select samples from each failing class
+        # Group by class (using torch operations)
+        unique_classes = torch.unique(y_test[misclassified_indices])
         final_selected_indices = []
 
-        # Process each failing class
-        for class_id, class_samples in class_indices.items():
-            print(f"\nProcessing misclassified samples for class {self.label_encoder.inverse_transform([class_id])[0]}")
+        # Process each class
+        for class_id in unique_classes:
+            class_mask = y_test[misclassified_indices] == class_id
+            class_indices = misclassified_indices[class_mask]
 
-            # Get probabilities for samples in this class
-            class_sample_indices = [idx[0] for idx in class_samples]
+            if len(class_indices) == 0:
+                continue
 
-            # Convert list of indices to tensor for proper indexing
-            test_idx_tensor = torch.tensor([test_indices[i] for i in class_sample_indices],
-                                         device=self.device)
-            class_samples_data = self.X_tensor[test_idx_tensor]
+            # Get all class samples data at once
+            class_samples_data = self.X_tensor[test_indices[class_indices]]
 
-            # Compute probabilities based on model type
+            # Compute probabilities in one batch
             if modelType == "Histogram":
                 probs, _ = self._compute_batch_posterior(class_samples_data)
-            elif modelType == "Gaussian":
+            else:  # Gaussian
                 probs, _ = self._compute_batch_posterior_std(class_samples_data)
 
-            # Find samples with similar error margins
+            # Compute error margins (vectorized)
             true_probs = probs[:, class_id]
             pred_classes = torch.argmax(probs, dim=1)
             pred_probs = probs[torch.arange(len(pred_classes)), pred_classes]
             error_margins = pred_probs - true_probs
 
-            # Get maximum error margin
-            max_error_margin = error_margins.max().item()
+            # Find similar error samples (vectorized)
+            max_error = error_margins.max()
+            similar_mask = error_margins >= (max_error * (1 - tolerance))
+            similar_indices = torch.nonzero(similar_mask).squeeze()
 
-            # Find samples within tolerance of max error margin
-            similar_errors_mask = error_margins >= (max_error_margin * (1 - tolerance))
-
-            # Get feature cardinality and store sample information
-            similar_samples = []
-            for idx, is_similar in enumerate(similar_errors_mask):
-                if is_similar:
-                    orig_idx = test_indices[class_sample_indices[idx]]
-                    sample_data = self.X_tensor[orig_idx]
-
-                    # Compute feature cardinality
-                    feature_cardinality = 0
-                    for feat_pair in self.feature_pairs:
-                        pair_data = sample_data[feat_pair]
-                        unique_values = torch.unique(pair_data)
-                        feature_cardinality += len(unique_values)
-
-                    similar_samples.append({
-                        'idx': orig_idx,
-                        'test_idx': class_sample_indices[idx],
-                        'cardinality': feature_cardinality,
-                        'error_margin': error_margins[idx].item(),
-                        'pred_class': pred_classes[idx].item(),
-                        'data': sample_data
-                    })
-
-            if not similar_samples:
+            if len(similar_indices) == 0:
                 continue
 
-            # Sort by cardinality (ascending) and error margin (descending)
-            similar_samples.sort(key=lambda x: (x['cardinality'], -x['error_margin']))
+            # Get samples that passed error margin check
+            similar_samples_data = class_samples_data[similar_indices]
 
-            # Get cardinality threshold
-            cardinalities = [s['cardinality'] for s in similar_samples]
-            cardinality_threshold = np.median(cardinalities)
+            # Compute cardinalities in one batch
+            cardinalities = self._compute_feature_cardinalities(similar_samples_data)
 
-            # Group samples by cardinality
-            low_cardinality_samples = [s for s in similar_samples if s['cardinality'] <= cardinality_threshold]
-            high_cardinality_samples = [s for s in similar_samples if s['cardinality'] > cardinality_threshold]
+            # Split by cardinality threshold
+            cardinality_threshold = torch.median(cardinalities)
+            low_card_mask = cardinalities <= cardinality_threshold
 
-            # Process low cardinality samples with diversity check
-            if low_cardinality_samples:
-                # Stack sample data for diversity computation
-                sample_data = torch.stack([s['data'] for s in low_cardinality_samples])
+            # Process low cardinality samples
+            if low_card_mask.any():
+                low_card_data = similar_samples_data[low_card_mask]
+                low_card_margins = error_margins[similar_indices][low_card_mask]
+                low_card_orig_indices = test_indices[class_indices[similar_indices[low_card_mask]]]
 
-                # Compute pairwise divergences
-                divergences = self._compute_sample_divergence(sample_data, self.feature_pairs)
+                # Compute divergences for low cardinality samples
+                divergences = self._compute_sample_divergence(low_card_data, self.feature_pairs)
 
-                # Select diverse samples
-                selected_samples = []
-                remaining_samples = list(range(len(low_cardinality_samples)))
+                # Select diverse samples efficiently
+                selected_mask = torch.zeros(len(low_card_data), dtype=torch.bool, device=self.device)
 
                 # Start with highest error margin
-                error_margins = torch.tensor([s['error_margin'] for s in low_cardinality_samples])
-                best_idx = error_margins[remaining_samples].argmax().item()
-                selected_samples.append(remaining_samples.pop(best_idx))
+                best_idx = torch.argmax(low_card_margins)
+                selected_mask[best_idx] = True
 
-                # Add remaining samples if they're diverse enough
-                while remaining_samples:
-                    # Compute minimum divergence to already selected samples
-                    min_divs = []
-                    for idx in remaining_samples:
-                        divs_to_selected = [divergences[idx, sel_idx] for sel_idx in selected_samples]
-                        min_divs.append(min(divs_to_selected))
+                # Iteratively add diverse samples
+                while True:
+                    # Compute minimum divergence to selected samples
+                    min_divs = divergences[:, selected_mask].min(dim=1)[0]
 
-                    # Find candidates that meet minimum divergence
-                    diverse_candidates = [idx for idx, div in zip(remaining_samples, min_divs)
-                                       if div >= min_divergence]
-
-                    if not diverse_candidates:
+                    # Find candidates meeting divergence threshold
+                    candidate_mask = (~selected_mask) & (min_divs >= min_divergence)
+                    if not candidate_mask.any():
                         break
 
-                    # Select highest error margin among diverse candidates
-                    candidate_margins = error_margins[diverse_candidates]
-                    best_diverse_idx = diverse_candidates[candidate_margins.argmax().item()]
+                    # Select highest error margin among candidates
+                    candidate_margins = low_card_margins.clone()
+                    candidate_margins[~candidate_mask] = float('-inf')
+                    best_idx = torch.argmax(candidate_margins)
+                    selected_mask[best_idx] = True
 
-                    selected_samples.append(best_diverse_idx)
-                    remaining_samples.remove(best_diverse_idx)
+                # Add selected samples
+                selected_indices = low_card_orig_indices[selected_mask]
+                final_selected_indices.extend(selected_indices.tolist())
 
-                # Add selected diverse samples
-                for idx in selected_samples:
-                    sample = low_cardinality_samples[idx]
-                    final_selected_indices.append(sample['idx'])
+                # Print information about selected samples
+                true_class_name = self.label_encoder.inverse_transform([class_id.item()])[0]
+                for idx, is_selected in enumerate(selected_mask):
+                    if is_selected:
+                        pred_class = pred_classes[similar_indices[low_card_mask]][idx]
+                        pred_class_name = self.label_encoder.inverse_transform([pred_class.item()])[0]
+                        print(f"Adding diverse low-cardinality sample from class {true_class_name} "
+                              f"(misclassified as {pred_class_name}, "
+                              f"error margin: {low_card_margins[idx].item():.3f}, "
+                              f"cardinality: {cardinalities[low_card_mask][idx].item()})")
 
-                    # Print information about selected sample
-                    true_class_name = self.label_encoder.inverse_transform([class_id])[0]
-                    pred_class_name = self.label_encoder.inverse_transform([sample['pred_class']])[0]
-                    print(f"Adding diverse low-cardinality sample from class {true_class_name} "
-                          f"(misclassified as {pred_class_name}, error margin: {sample['error_margin']:.3f}, "
-                          f"cardinality: {sample['cardinality']})")
+            # Add one high cardinality sample if no low cardinality samples were selected
+            elif not final_selected_indices:
+                high_card_mask = ~low_card_mask
+                if high_card_mask.any():
+                    high_card_margins = error_margins[similar_indices][high_card_mask]
+                    best_idx = torch.argmax(high_card_margins)
+                    selected_idx = test_indices[class_indices[similar_indices[high_card_mask]]][best_idx]
+                    final_selected_indices.append(selected_idx.item())
 
-            # Add one high cardinality sample with highest error margin if no low cardinality samples were selected
-            if high_cardinality_samples and not selected_samples:
-                best_sample = max(high_cardinality_samples, key=lambda x: x['error_margin'])
-                final_selected_indices.append(best_sample['idx'])
-
-                true_class_name = self.label_encoder.inverse_transform([class_id])[0]
-                pred_class_name = self.label_encoder.inverse_transform([best_sample['pred_class']])[0]
-                print(f"Adding high-cardinality sample from class {true_class_name} "
-                      f"(misclassified as {pred_class_name}, error margin: {best_sample['error_margin']:.3f}, "
-                      f"cardinality: {best_sample['cardinality']})")
+                    true_class_name = self.label_encoder.inverse_transform([class_id.item()])[0]
+                    pred_class = pred_classes[similar_indices[high_card_mask]][best_idx]
+                    pred_class_name = self.label_encoder.inverse_transform([pred_class.item()])[0]
+                    print(f"Adding high-cardinality sample from class {true_class_name} "
+                          f"(misclassified as {pred_class_name}, "
+                          f"error margin: {high_card_margins[best_idx].item():.3f}, "
+                          f"cardinality: {cardinalities[high_card_mask][best_idx].item()})")
 
         print(f"\nTotal samples selected: {len(final_selected_indices)}")
         return final_selected_indices
