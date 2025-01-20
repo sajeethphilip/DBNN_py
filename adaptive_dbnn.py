@@ -830,7 +830,7 @@ class GPUDBNN:
             self.random_state = random_state
             self.shuffle_state =1
         else:
-            self.random_state =42
+            self.random_state = -1
             self.shuffle_state =-1
         #self.compute_dtype = torch.float64  # Use double precision for computations
         self.cardinality_tolerance = cardinality_tolerance  # Only for feature grouping
@@ -841,7 +841,6 @@ class GPUDBNN:
 
         # Load configuration and data
         self.config = DatasetConfig.load_config(self.dataset_name)
-        self.data = self._load_dataset()
         self.target_column = self.config['target_column']
 
         # Initialize model components
@@ -912,14 +911,7 @@ class GPUDBNN:
         # Load dataset configuration and data
         self.config = DatasetConfig.load_config(self.dataset_name)
         self.data = self._load_dataset()
-        #---------------------------Shuffle data if shuffle state is -1 -------------------
-        if  self.shuffle_state == -1:
-            # Perform 3 rounds of shuffling
-            tmpx=self.data
-            for _ in range(3):
-                tmpx = tmpx.sample(frac=1.0)
-            self.data=tmpx
-       #----------------------------------------------------------------------------------
+
         self.target_column = self.config['target_column']
 
         # Load saved weights and encoders
@@ -1135,6 +1127,32 @@ class GPUDBNN:
                 DEBUG.log(f" Dataset loaded successfully. Shape: {df.shape}")
                 DEBUG.log(f" Columns: {df.columns.tolist()}")
                 DEBUG.log(f" Data types:\n{df.dtypes}")
+
+                # Create data directory path
+                dataset_folder = os.path.splitext(os.path.basename(self.dataset_name))[0]
+                base_path = self.config.get('training_params', {}).get('training_save_path', 'training_data')
+                data_dir = os.path.join(base_path, dataset_folder, 'data')
+                shuffled_file = os.path.join(data_dir, 'shuffled_data.csv')
+
+                # Check if this is a fresh start with random shuffling
+                if self.fresh_start and self.random_state == -1:
+                    print("Fresh start with random shuffling enabled")
+
+                    # Perform 3 rounds of truly random shuffling
+                    for _ in range(3):
+                        df = df.iloc[np.random.permutation(len(df))].reset_index(drop=True)
+
+                    # Ensure directory exists before saving
+                    os.makedirs(data_dir, exist_ok=True)
+
+                    # Save shuffled data
+                    df.to_csv(shuffled_file, index=False)
+                    print(f"Saved shuffled data to {shuffled_file}")
+                elif os.path.exists(shuffled_file):
+                    print(f"Loading previously shuffled data from {shuffled_file}")
+                    df = pd.read_csv(shuffled_file)
+                else:
+                    print("Using original data order (no shuffling required)")
 
                 return df
 
@@ -1975,40 +1993,40 @@ class GPUDBNN:
         return torch.FloatTensor(X_scaled)
 
     def _generate_feature_combinations(self, n_features: int, group_size: int, max_combinations: int = None) -> torch.Tensor:
-        """
-        Generate feature combinations of specified size with validation checks
+        """Generate and save/load consistent feature combinations"""
+        # Create path for storing feature combinations
+        dataset_folder = os.path.splitext(os.path.basename(self.dataset_name))[0]
+        base_path = self.config.get('training_params', {}).get('training_save_path', 'training_data')
+        combinations_path = os.path.join(base_path, dataset_folder, 'feature_combinations.pkl')
 
-        Args:
-            n_features: Total number of features
-            group_size: Number of features in each group
-            max_combinations: Optional maximum number of combinations to use
+        # Check if combinations already exist
+        if os.path.exists(combinations_path):
+            with open(combinations_path, 'rb') as f:
+                combinations_tensor = pickle.load(f)
+                return combinations_tensor.to(self.device)
 
-        Returns:
-            Tensor containing feature combinations
-        """
+        # Generate new combinations if none exist
         if n_features < group_size:
             raise ValueError(f"Number of features ({n_features}) must be >= group size ({group_size})")
 
         # Generate all possible combinations
         all_combinations = list(combinations(range(n_features), group_size))
-
         if not all_combinations:
-            # If no combinations were generated, raise an error
             raise ValueError(f"No valid combinations generated for {n_features} features in groups of {group_size}")
 
-        # If max_combinations specified and less than total combinations,
-        # randomly sample combinations
+        # Sample combinations if max_combinations specified
         if max_combinations and len(all_combinations) > max_combinations:
-            import random
-            random.seed(self.random_state)
-            all_combinations = random.sample(all_combinations, max_combinations)
+            # Use fixed seed for consistent sampling
+            rng = np.random.RandomState(42)
+            all_combinations = rng.choice(all_combinations, max_combinations, replace=False)
 
-        # Convert to tensor and ensure it's on the correct device
+        # Convert to tensor
         combinations_tensor = torch.tensor(all_combinations, device=self.device)
 
-        # Validate the output tensor
-        if combinations_tensor.nelement() == 0:
-            raise ValueError("Generated empty feature combinations tensor")
+        # Save combinations for future use
+        os.makedirs(os.path.dirname(combinations_path), exist_ok=True)
+        with open(combinations_path, 'wb') as f:
+            pickle.dump(combinations_tensor.cpu(), f)
 
         return combinations_tensor
 #-----------------------------------------------------------------------------Bin model ---------------------------
@@ -3408,13 +3426,10 @@ class GPUDBNN:
                 y_tensor = torch.LongTensor(y_encoded).to(self.device)
 
                 # Split data
-                X_train, X_test, y_train, y_test = train_test_split(
-                    X_tensor.cpu().numpy(),
-                    y_tensor.cpu().numpy(),
-                    test_size=self.test_size,
-                    random_state=self.random_state,
-                    stratify=y_tensor.cpu().numpy()
-                )
+                # Get consistent train-test split
+                X_train, X_test, y_train, y_test = self._get_train_test_split(
+                    X_tensor, y_tensor)
+
 
                 # Convert split data back to tensors
                 X_train = torch.from_numpy(X_train).to(self.device, dtype=torch.float32)
@@ -3742,12 +3757,48 @@ def run_gpu_benchmark(dataset_name: str, model=None, batch_size: int = 32):
 
     return model, results
 
+def _get_train_test_split(self, X_tensor, y_tensor):
+    """Get or create consistent train-test split"""
+    dataset_folder = os.path.splitext(os.path.basename(self.dataset_name))[0]
+    base_path = self.config.get('training_params', {}).get('training_save_path', 'training_data')
+    split_path = os.path.join(base_path, dataset_folder, 'train_test_split.pkl')
+
+    if os.path.exists(split_path):
+        with open(split_path, 'rb') as f:
+            split_indices = pickle.load(f)
+            train_idx, test_idx = split_indices['train'], split_indices['test']
+            return (X_tensor[train_idx], X_tensor[test_idx],
+                    y_tensor[train_idx], y_tensor[test_idx])
+
+    # Create new split
+    X_train, X_test, y_train, y_test = train_test_split_tensor(
+        X_tensor, y_tensor, self.test_size, self.random_state)
+
+    # Save split indices
+    os.makedirs(os.path.dirname(split_path), exist_ok=True)
+    split_indices = {
+        'train': torch.where(X_tensor == X_train.unsqueeze(1))[0],
+        'test': torch.where(X_tensor == X_test.unsqueeze(1))[0]
+    }
+    with open(split_path, 'wb') as f:
+        pickle.dump(split_indices, f)
+
+    return X_train, X_test, y_train, y_test
+
 def train_test_split_tensor(X, y, test_size, random_state):
+    """Split data consistently using fixed indices"""
     num_samples = len(X)
-    indices = torch.randperm(num_samples, device=X.device)
+
+    # Generate fixed permutation
+    if random_state == -1:
+        random_state = 42
+    rng = np.random.RandomState(random_state)
+    indices = torch.from_numpy(rng.permutation(num_samples))
+
     split = int(num_samples * (1 - test_size))
     train_idx = indices[:split]
     test_idx = indices[split:]
+
     return X[train_idx], X[test_idx], y[train_idx], y[test_idx]
 
 def plot_training_progress(error_rates: List[float], dataset_name: str):
