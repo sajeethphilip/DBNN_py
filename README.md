@@ -9,7 +9,7 @@ The Difference Boosting Neural Network (DBNN), initially published in Intelligen
 - **Gaussian Model**: Uses multivariate normal distribution for feature pair modelling
 
 ### Adaptive Learning
-Based on "What is there in a training sample?" (2009 World Congress on Nature & Biologically Inspired Computing), the implementation includes smart sample selection with configurable parameters:
+Based on "What is there in a training sample?" (2009 World Congress on Nature & Biologically Inspired Computing), the implementation includes brilliant sample selection with configurable parameters:
 
 - `active_learning_tolerance`: Controls sample selection based on probability margins
   - Range: 1.0 to 99.0 (higher means more samples selected)
@@ -74,13 +74,15 @@ Based on "What is there in a training sample?" (2009 World Congress on Nature & 
     "target_column": "income",
     "separator": ",",
     "has_header": true,
+    "training_params": {
+        "Save_training_epochs": false,   // Save the data corresponding to each epoch if set to true in the 
+        "training_save_path": "training_data"  //folder specified here.
+    },
     "likelihood_config": {
-        "feature_group_size": 2,
+        "feature_group_size": 2,    // specify how many features will be considered together for conditional independence. 
         "max_combinations": 1000,
-        "bin_sizes": [
-            21
-        ],
-        "boosting_enabled": true,
+        "bin_sizes": [21],          // Can also specify different bin sizes for each feature  used in the Histogram model.
+        "boosting_enabled": true,    // not currently in use
         "boosting_factor": 1.5,
         "active_learning_tolerance": 1.0,  // Percentage tolerance for similar probabilities
         "cardinality_threshold_percentile": 95  // Optional, defaults to 95
