@@ -92,9 +92,10 @@ class Colors:
 class DatasetConfig:
     """Enhanced dataset configuration handling with support for column names and URLs"""
 
+class DatasetConfig:
     DEFAULT_CONFIG = {
         "file_path": None,
-        "column_names": None,  # Added support for column names
+        "column_names": None,
         "target_column": "target",
         "separator": ",",
         "has_header": True,
@@ -102,8 +103,14 @@ class DatasetConfig:
             "feature_group_size": 2,
             "max_combinations": 1000,
             "bin_sizes": [20]
+        },
+        "active_learning": {
+            "tolerance": 1.0,  # Default 1% tolerance for probability matching
+            "cardinality_threshold_percentile": 95 # Default 95th percentile
         }
     }
+
+
 
     @staticmethod
     def is_url(path: str) -> bool:
@@ -134,29 +141,31 @@ class DatasetConfig:
 
         return True
 
-    @staticmethod
-    def create_default_config(dataset_name: str) -> Dict:
-        """Create a default configuration file with enhanced defaults"""
-        config = DatasetConfig.DEFAULT_CONFIG.copy()
-        config['file_path'] = f"{dataset_name}.csv"
+        @staticmethod
+        def create_default_config(dataset_name: str) -> Dict:
+            """Create a default configuration file with enhanced defaults"""
+            config = DatasetConfig.DEFAULT_CONFIG.copy()
+            config['file_path'] = f"{dataset_name}.csv"
 
-        # Try to infer column names from CSV if it exists
-        if os.path.exists(config['file_path']):
-            try:
-                with open(config['file_path'], 'r') as f:
-                    header = f.readline().strip()
-                    config['column_names'] = header.split(config['separator'])
-                    if config['column_names']:
-                        config['target_column'] = config['column_names'][-1]
-            except:
-                pass
+            # Try to infer column names from CSV if it exists
+            if os.path.exists(config['file_path']):
+                try:
+                    with open(config['file_path'], 'r') as f:
+                        header = f.readline().strip()
+                        config['column_names'] = header.split(config['separator'])
+                        if config['column_names']:
+                            config['target_column'] = config['column_names'][-1]
+                except:
+                    pass
 
-        config_path = f"{dataset_name}.conf"
-        with open(config_path, 'w') as f:
-            json.dump(config, f, indent=4)
+            config_path = f"{dataset_name}.conf"
+            with open(config_path, 'w') as f:
+                json.dump(config, f, indent=4)
 
-        print(f"Created default configuration file: {config_path}")
-        return config
+            print(f"Created default configuration file: {config_path}")
+            return config
+
+
 
     @staticmethod
     def format_config_file(dataset_name: str) -> bool:
@@ -181,9 +190,8 @@ class DatasetConfig:
 
     @staticmethod
     def load_config(dataset_name: str) -> Dict:
-        """Enhanced configuration loading with better error handling"""
+        """Enhanced configuration loading with complete error handling and parameter validation"""
         config_path = f"{dataset_name}.conf"
-
         try:
             # Check if configuration file exists
             if not os.path.exists(config_path):
@@ -199,7 +207,6 @@ class DatasetConfig:
             def remove_comments(json_str):
                 lines = []
                 in_multiline_comment = False
-
                 for line in json_str.split('\n'):
                     # Handle multi-line comments
                     if '/*' in line and '*/' in line:
@@ -221,7 +228,6 @@ class DatasetConfig:
                     stripped = line.strip()
                     if stripped:
                         lines.append(stripped)
-
                 return '\n'.join(lines)
 
             clean_config = remove_comments(config_text)
@@ -233,9 +239,28 @@ class DatasetConfig:
                 print("Creating default configuration instead")
                 return DatasetConfig.create_default_config(dataset_name)
 
-            # Validate and update configuration with defaults
+            # Create validated config starting with defaults
             validated_config = DatasetConfig.DEFAULT_CONFIG.copy()
-            validated_config.update(config)
+
+            # Update with provided config while preserving nested structures
+            def deep_update(base_dict, update_dict):
+                for key, value in update_dict.items():
+                    if isinstance(value, dict) and key in base_dict and isinstance(base_dict[key], dict):
+                        deep_update(base_dict[key], value)
+                    else:
+                        base_dict[key] = value
+
+            deep_update(validated_config, config)
+
+            # Ensure active learning parameters are present with correct defaults
+            if 'active_learning' not in validated_config:
+                validated_config['active_learning'] = DatasetConfig.DEFAULT_CONFIG['active_learning'].copy()
+            else:
+                # Ensure all active learning parameters have defaults
+                default_active_learning = DatasetConfig.DEFAULT_CONFIG['active_learning']
+                for key, value in default_active_learning.items():
+                    if key not in validated_config['active_learning']:
+                        validated_config['active_learning'][key] = value
 
             # Check if file path exists
             if not validated_config.get('file_path'):
@@ -247,6 +272,11 @@ class DatasetConfig:
                 if not DatasetConfig.is_url(validated_config['file_path']):
                     print(f"Neither local file nor URL found for {dataset_name}")
                     return None
+
+            # Print active learning configuration for verification
+            print(f"\nActive Learning Configuration:")
+            print(f"- Probability tolerance: {validated_config['active_learning']['tolerance']}%")
+            print(f"- Cardinality threshold percentile: {validated_config['active_learning']['cardinality_threshold_percentile']}%")
 
             return validated_config
 
@@ -748,7 +778,7 @@ class GPUDBNN:
         # Initialize train/test indices
         self.train_indices = []
         self.test_indices = None
-
+        self._last_metrics_printed =False
         # Add new attribute for bin-specific weights
         self.n_bins_per_dim = n_bins_per_dim
         self.weight_updater = None  # Will be initialized after computing likelihood params
@@ -1092,9 +1122,6 @@ class GPUDBNN:
 
     def _compute_batch_posterior(self, features: torch.Tensor, epsilon: float = 1e-10):
         """Optimized batch posterior with vectorized operations"""
-        if modelType == "Gaussian":
-            return self._compute_batch_posterior_std(features, epsilon)
-
         # Safety checks
         if self.weight_updater is None:
             DEBUG.log(" Weight updater not initialized, initializing now...")
@@ -1122,7 +1149,7 @@ class GPUDBNN:
         ]).transpose(0, 1)  # [batch_size, n_pairs, 2]
 
         # Compute all bin indices at once
-        bin_indices_list = []
+        bin_indices_dict = {}
         for group_idx in range(len(self.likelihood_params['feature_pairs'])):
             bin_edges = self.likelihood_params['bin_edges'][group_idx]
             edges = torch.stack([edge.contiguous() for edge in bin_edges])
@@ -1136,12 +1163,12 @@ class GPUDBNN:
                 for dim in range(2)
             ])  # [2, batch_size]
             indices = indices.sub_(1).clamp_(0, self.n_bins_per_dim - 1)
-            bin_indices_list.append(indices)
+            bin_indices_dict[group_idx] = indices
 
         # Process all classes simultaneously
         for group_idx in range(len(self.likelihood_params['feature_pairs'])):
             bin_probs = self.likelihood_params['bin_probs'][group_idx]  # [n_classes, n_bins, n_bins]
-            indices = bin_indices_list[group_idx]  # [2, batch_size]
+            indices = bin_indices_dict[group_idx]  # [2, batch_size]
 
             # Get all weights at once
             weights = torch.stack([
@@ -1165,7 +1192,7 @@ class GPUDBNN:
         posteriors = torch.exp(log_likelihoods - max_log_likelihood)
         posteriors /= posteriors.sum(dim=1, keepdim=True) + epsilon
 
-        return posteriors, dict(enumerate(bin_indices_list))
+        return posteriors, bin_indices_dict if modelType == "Histogram" else None
 #----------------------
 
     def set_feature_bounds(self, dataset):
@@ -1226,11 +1253,58 @@ class GPUDBNN:
 
         return train_indices, test_indices
 
+    def _compute_cardinality_threshold(self, cardinalities, config=None):
+        """
+        Compute the cardinality threshold using percentile-based analysis.
 
+        Args:
+            cardinalities: List of cardinality values
+            config: Configuration dictionary with threshold parameters
+
+        Returns:
+            float: Computed cardinality threshold
+        """
+        # Get active learning parameters from config
+        active_learning_config = self.config.get('active_learning', {})
+        percentile = active_learning_config.get('cardinality_threshold_percentile', 95)
+
+        # If no cardinalities provided, create a synthetic distribution
+        if not cardinalities:
+            print("\nWarning: No cardinality data available. Using synthetic distribution based on percentile.")
+            # Create a synthetic distribution around the percentile threshold
+            cardinalities = np.array([1.0, 2.0, 5.0, 10.0, 20.0])  # Synthetic values
+        else:
+            cardinalities = np.array(cardinalities)
+
+        # Compute basic statistics
+        min_card = np.min(cardinalities)
+        max_card = np.max(cardinalities)
+        mean_card = np.mean(cardinalities)
+        median_card = np.median(cardinalities)
+
+        # Compute threshold using percentile
+        threshold = np.percentile(cardinalities, percentile)
+
+        # Print detailed analysis
+        print(f"\nCardinality Analysis:")
+        print(f"- Using {percentile}th percentile threshold")
+        print(f"- Distribution statistics:")
+        print(f"  - Min: {min_card:.2f}")
+        print(f"  - Max: {max_card:.2f}")
+        print(f"  - Mean: {mean_card:.2f}")
+        print(f"  - Median: {median_card:.2f}")
+        print(f"  - Threshold: {threshold:.2f}")
+
+        # Print number of samples that would be included
+        n_included = sum(c <= threshold for c in cardinalities)
+        print(f"- {n_included} out of {len(cardinalities)} samples below threshold "
+              f"({(n_included/len(cardinalities))*100:.1f}%)")
+
+        return threshold
 
     def _select_samples_from_failed_classes(self, test_predictions, y_test, test_indices):
         """
-        Select one sample from each failing class in the test set.
+        Select samples from each failing class, considering probability similarity and feature cardinality.
 
         Args:
             test_predictions: Predicted labels for test set
@@ -1240,6 +1314,10 @@ class GPUDBNN:
         Returns:
             List of selected indices for training
         """
+        # Get active learning parameters from config
+        active_learning_config = self.config.get('active_learning', {})
+        tolerance = active_learning_config.get('tolerance', 1.0) / 100.0
+
         # Convert tensors to CPU numpy arrays if needed
         test_predictions = test_predictions.cpu() if torch.is_tensor(test_predictions) else test_predictions
         y_test_cpu = y_test.cpu() if torch.is_tensor(y_test) else y_test
@@ -1258,7 +1336,7 @@ class GPUDBNN:
             # Store both test index and original dataset index
             class_indices[true_class].append((idx, test_indices[idx]))
 
-        # Select one example from each failing class
+        # Select samples from each failing class
         selected_indices = []
 
         # Process each failing class
@@ -1276,24 +1354,63 @@ class GPUDBNN:
             elif modelType == "Gaussian":
                 probs, _ = self._compute_batch_posterior_std(class_samples_data)
 
-            # Find sample with highest error margin
+            # Find samples with similar error margins
             true_probs = probs[:, class_id]
             pred_classes = torch.argmax(probs, dim=1)
             pred_probs = probs[torch.arange(len(pred_classes)), pred_classes]
             error_margins = pred_probs - true_probs
 
-            # Select sample with highest error margin
-            worst_idx = torch.argmax(error_margins)
-            selected_original_idx = class_samples[worst_idx.item()][1]  # Get original dataset index
+            # Get maximum error margin
+            max_error_margin = error_margins.max().item()
 
-            # Print information about selected sample
-            true_class_name = self.label_encoder.inverse_transform([class_id])[0]
-            pred_class = pred_classes[worst_idx].item()
-            pred_class_name = self.label_encoder.inverse_transform([pred_class])[0]
-            print(f"Adding sample from class {true_class_name} (misclassified as {pred_class_name}, "
-                  f"error margin: {error_margins[worst_idx].item():.3f})")
+            # Find samples within tolerance of max error margin
+            similar_errors_mask = error_margins >= (max_error_margin * (1 - tolerance))
 
-            selected_indices.append(selected_original_idx)
+            # Get feature cardinality for these samples
+            similar_samples = []
+            for idx, is_similar in enumerate(similar_errors_mask):
+                if is_similar:
+                    orig_idx = test_indices[class_sample_indices[idx]]
+                    sample_data = self.X_tensor[orig_idx]
+
+                    # Compute feature cardinality (number of unique values)
+                    feature_cardinality = 0
+                    for feat_pair in self.feature_pairs:
+                        pair_data = sample_data[feat_pair]
+                        unique_values = torch.unique(pair_data)
+                        feature_cardinality += len(unique_values)
+
+                    similar_samples.append({
+                        'idx': orig_idx,
+                        'test_idx': class_sample_indices[idx],
+                        'cardinality': feature_cardinality,
+                        'error_margin': error_margins[idx].item(),
+                        'pred_class': pred_classes[idx].item()
+                    })
+
+            # Sort by cardinality (ascending) and error margin (descending)
+            similar_samples.sort(key=lambda x: (x['cardinality'], -x['error_margin']))
+
+            # If we have samples with similar error margins and low cardinality, add them all
+            cardinality_threshold = np.median([s['cardinality'] for s in similar_samples])
+            for sample in similar_samples:
+                if sample['cardinality'] <= cardinality_threshold:
+                    selected_indices.append(sample['idx'])
+
+                    # Print information about selected sample
+                    true_class_name = self.label_encoder.inverse_transform([class_id])[0]
+                    pred_class_name = self.label_encoder.inverse_transform([sample['pred_class']])[0]
+                    print(f"Adding sample from class {true_class_name} (misclassified as {pred_class_name}, "
+                          f"error margin: {sample['error_margin']:.3f}, cardinality: {sample['cardinality']})")
+                else:
+                    # For higher cardinality samples, just take the one with highest error margin
+                    if len([idx for idx in selected_indices if idx in [s['idx'] for s in similar_samples]]) == 0:
+                        selected_indices.append(sample['idx'])
+                        true_class_name = self.label_encoder.inverse_transform([class_id])[0]
+                        pred_class_name = self.label_encoder.inverse_transform([sample['pred_class']])[0]
+                        print(f"Adding high-cardinality sample from class {true_class_name} "
+                              f"(misclassified as {pred_class_name}, error margin: {sample['error_margin']:.3f}, "
+                              f"cardinality: {sample['cardinality']})")
 
         return selected_indices
 
@@ -1301,7 +1418,10 @@ class GPUDBNN:
                             improvement_threshold: float = 0.001,
                             load_epoch: int = None,
                             batch_size: int = 32):
-        """Modified adaptive training strategy with retry mechanism"""
+        """
+        Modified adaptive training strategy that monitors overall improvement across rounds.
+        Stops if adding new samples doesn't improve accuracy after several rounds.
+        """
         DEBUG.log(" Starting adaptive_fit_predict")
         if not EnableAdaptive:
             print("Adaptive learning is disabled. Using standard training.")
@@ -1323,6 +1443,7 @@ class GPUDBNN:
 
             # Use existing label encoder
             y_encoded = self.label_encoder.transform(y)
+
             # Process features and initialize model components if needed
             X_processed = self._preprocess_data(X, is_training=True)
             self.X_tensor = torch.FloatTensor(X_processed).to(self.device)
@@ -1425,6 +1546,11 @@ class GPUDBNN:
             DEBUG.log(f" Initial training set size: {len(train_indices)}")
             DEBUG.log(f" Initial test set size: {len(test_indices)}")
 
+            # Initialize adaptive learning patience tracking
+            adaptive_patience = 5  # Number of rounds to wait for improvement
+            adaptive_patience_counter = 0
+            best_overall_accuracy = 0
+
             # Training loop
             for round_num in range(max_rounds):
                 print(f"\nRound {round_num + 1}/{max_rounds}")
@@ -1435,56 +1561,51 @@ class GPUDBNN:
                 X_train = self.X_tensor[train_indices]
                 y_train = self.y_tensor[train_indices]
 
-                # Initialize variables for retry mechanism
-                patience_counter = 0
-                best_train_accuracy = 0
-                patience = 5 if self.in_adaptive_fit else Trials
-                last_train_accuracy = 0
+                # Train the model
+                save_path = f"round_{round_num}_predictions.csv"
+                self.train_indices = train_indices
+                self.test_indices = test_indices
+                results = self.fit_predict(batch_size=batch_size, save_path=save_path)
 
-                # Training retry loop - keep training with current samples until success or patience exhausted
-                while patience_counter < patience:
-                    # Train the model
-                    save_path = f"round_{round_num}_predictions.csv"
-                    self.train_indices = train_indices
-                    self.test_indices = test_indices
-                    results = self.fit_predict(batch_size=batch_size, save_path=save_path)
+                # Check training accuracy
+                train_predictions = self.predict(X_train, batch_size=batch_size)
+                train_accuracy = (train_predictions == y_train.cpu()).float().mean()
+                print(f"Training accuracy: {train_accuracy:.4f}")
 
-                    # Check training accuracy
-                    train_predictions = self.predict(X_train, batch_size=batch_size)
-                    train_accuracy = (train_predictions == y_train.cpu()).float().mean()
-                    print(f"Training attempt accuracy: {train_accuracy:.4f}")
+                # Check if we're improving overall
+                if train_accuracy > best_overall_accuracy + improvement_threshold:
+                    best_overall_accuracy = train_accuracy
+                    adaptive_patience_counter = 0
+                    print(f"Improved overall accuracy to {train_accuracy:.4f}")
+                else:
+                    adaptive_patience_counter += 1
+                    print(f"No significant overall improvement. Adaptive patience: {adaptive_patience_counter}/{adaptive_patience}")
 
-                    if train_accuracy == 1.0:
-                        print("Achieved 100% training accuracy")
+                    if adaptive_patience_counter >= adaptive_patience:
+                        print(f"No improvement in training accuracy after {adaptive_patience} rounds of adding samples.")
+                        print(f"Best accuracy achieved: {best_overall_accuracy:.4f}")
+                        print("Stopping adaptive training.")
                         break
 
-                    # Check if we're improving
-                    if train_accuracy > best_train_accuracy + improvement_threshold:
-                        best_train_accuracy = train_accuracy
-                        patience_counter = 0  # Reset patience if we improve
-                        print(f"Improved training accuracy to {train_accuracy:.4f}")
-                    else:
-                        patience_counter += 1
-                        print(f"No significant improvement. Patience: {patience_counter}/{patience}")
+                # Evaluate test data
+                X_test = self.X_tensor[test_indices]
+                y_test = self.y_tensor[test_indices]
+                test_predictions = self.predict(X_test, batch_size=batch_size)
 
-                    last_train_accuracy = train_accuracy
-
-                # After training attempts, proceed based on outcome
-                if last_train_accuracy == 1.0:
-                    if len(test_indices) == 0:
-                        print("No more test samples available. Training complete.")
-                        break
-
-                    # Evaluate test data
-                    X_test = self.X_tensor[test_indices]
-                    y_test = self.y_tensor[test_indices]
-                    test_predictions = self.predict(X_test, batch_size=batch_size)
-
-                    # Print confusion matrix and class-wise accuracy
+                # Only print test performance header if we didn't just print metrics in fit_predict
+                if not hasattr(self, '_last_metrics_printed') or not self._last_metrics_printed:
                     print(f"\n{Colors.BLUE}Test Set Performance - Round {round_num + 1}{Colors.ENDC}")
                     y_test_cpu = y_test.cpu().numpy()
                     test_predictions_cpu = test_predictions.cpu().numpy()
                     self.print_colored_confusion_matrix(y_test_cpu, test_predictions_cpu)
+
+                # Reset the metrics printed flag
+                self._last_metrics_printed = False
+
+                if train_accuracy == 1.0:
+                    if len(test_indices) == 0:
+                        print("No more test samples available. Training complete.")
+                        break
 
                     # Get new training samples from misclassified examples
                     new_train_indices = self._select_samples_from_failed_classes(
@@ -1495,37 +1616,20 @@ class GPUDBNN:
                         print("Achieved 100% accuracy on all data. Training complete.")
                         break
 
-                    train_indices.extend(new_train_indices)
-                    test_indices = list(set(test_indices) - set(new_train_indices))
-
                 else:
-                    # Training failed to achieve 100% accuracy after all attempts
-                    print(f"Failed to achieve 100% accuracy after {patience} attempts.")
-                    print("Selecting new samples to augment training set...")
-
-                    # Evaluate test data
-                    X_test = self.X_tensor[test_indices]
-                    y_test = self.y_tensor[test_indices]
-                    test_predictions = self.predict(X_test, batch_size=batch_size)
-
-                    # Print confusion matrix and class-wise accuracy
-                    print(f"\n{Colors.BLUE}Test Set Performance - Round {round_num + 1}{Colors.ENDC}")
-                    y_test_cpu = y_test.cpu().numpy()
-                    test_predictions_cpu = test_predictions.cpu().numpy()
-                    self.print_colored_confusion_matrix(y_test_cpu, test_predictions_cpu)
-
-                    # Select new samples from failing classes
+                    # Training did not achieve 100% accuracy, select new samples
                     new_train_indices = self._select_samples_from_failed_classes(
                         test_predictions, y_test, test_indices
                     )
 
-                    if new_train_indices:
-                        train_indices.extend(new_train_indices)
-                        test_indices = list(set(test_indices) - set(new_train_indices))
-                        print(f"Added {len(new_train_indices)} new samples to training set")
-                    else:
+                    if not new_train_indices:
                         print("No suitable new samples found. Training complete.")
                         break
+
+                # Update training and test sets with new samples
+                train_indices.extend(new_train_indices)
+                test_indices = list(set(test_indices) - set(new_train_indices))
+                print(f"Added {len(new_train_indices)} new samples to training set")
 
                 # Save the current split
                 self.save_last_split(train_indices, test_indices)
@@ -2008,8 +2112,9 @@ class GPUDBNN:
                 feature_pairs=self.feature_pairs,
                 n_bins_per_dim=self.n_bins_per_dim  # Number of Gaussian components
             )
+
     def _update_priors_parallel(self, failed_cases: List[Tuple], batch_size: int = 32):
-        """Vectorized weight updates"""
+        """Vectorized weight updates with proper error handling"""
         n_failed = len(failed_cases)
         if n_failed == 0:
             self.consecutive_successes += 1
@@ -2023,7 +2128,12 @@ class GPUDBNN:
         true_classes = torch.tensor([int(case[1]) for case in failed_cases], device=self.device)
 
         # Compute posteriors for all cases at once
-        posteriors, bin_indices = self._compute_batch_posterior(features)
+        if modelType == "Histogram":
+            posteriors, bin_indices = self._compute_batch_posterior(features)
+        else:  # Gaussian model
+            posteriors, _ = self._compute_batch_posterior_std(features)
+            return  # Gaussian model doesn't need bin-based updates
+
         pred_classes = torch.argmax(posteriors, dim=1)
 
         # Compute adjustments for all cases at once
@@ -2032,25 +2142,26 @@ class GPUDBNN:
         adjustments = self.learning_rate * (1.0 - (true_posteriors / pred_posteriors))
 
         # Update weights for each feature group
-        for group_idx in bin_indices:
-            bin_i, bin_j = bin_indices[group_idx]
+        if bin_indices is not None:  # Only proceed if we have bin indices (Histogram model)
+            for group_idx in bin_indices:
+                bin_i, bin_j = bin_indices[group_idx]
 
-            # Group updates by class for vectorization
-            for class_id in range(self.weight_updater.n_classes):
-                class_mask = true_classes == class_id
-                if not class_mask.any():
-                    continue
+                # Group updates by class for vectorization
+                for class_id in range(self.weight_updater.n_classes):
+                    class_mask = true_classes == class_id
+                    if not class_mask.any():
+                        continue
 
-                # Get relevant indices and adjustments for this class
-                class_bin_i = bin_i[class_mask]
-                class_bin_j = bin_j[class_mask]
-                class_adjustments = adjustments[class_mask]
+                    # Get relevant indices and adjustments for this class
+                    class_bin_i = bin_i[class_mask]
+                    class_bin_j = bin_j[class_mask]
+                    class_adjustments = adjustments[class_mask]
 
-                # Update weights for this class individually to avoid broadcasting issues
-                weights = self.weight_updater.histogram_weights[class_id][group_idx]
-                for idx in range(len(class_adjustments)):
-                    i, j = class_bin_i[idx], class_bin_j[idx]
-                    weights[i, j] += class_adjustments[idx]
+                    # Update weights for this class
+                    weights = self.weight_updater.histogram_weights[class_id][group_idx]
+                    for idx in range(len(class_adjustments)):
+                        i, j = class_bin_i[idx], class_bin_j[idx]
+                        weights[i, j] += class_adjustments[idx]
 #------------------------------------------Boost weights------------------------------------------
     def _update_weights_with_boosting(self, failed_cases: List[Tuple], batch_size: int = 32):
         """
@@ -3108,6 +3219,9 @@ class GPUDBNN:
     def fit_predict(self, batch_size: int = 32, save_path: str = None):
         """Full training and prediction pipeline with GPU optimization and optional prediction saving"""
         try:
+            # Set a flag to indicate we're printing metrics
+            self._last_metrics_printed = True
+
             # Check if we're in adaptive training
             if self.in_adaptive_fit:
                 if not hasattr(self, 'X_tensor') or not hasattr(self, 'y_tensor'):
