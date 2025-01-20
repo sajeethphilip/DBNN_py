@@ -85,6 +85,8 @@ Based on "What is there in a training sample?" (2009 World Congress on Nature & 
         "active_learning_tolerance": 1.0,  // Percentage tolerance for similar probabilities
         "cardinality_threshold_percentile": 95  // Optional, defaults to 95
         "min_divergence": 0.1  // Minimum required feature divergence between samples
+                              //Lower min_divergence (like 0.1) = MORE samples selected (but potentially more redundant)
+                              //Higher min_divergence (like 0.5) = FEWER samples selected (but more distinct from each other)
 
 }
 }
