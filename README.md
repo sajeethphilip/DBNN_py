@@ -27,7 +27,7 @@ Let me break down the key components of this GPU-optimized Deep Bayesian Neural 
         # or use variable bins:
         # "bin_sizes": [3, 7, 13, 21],
         "boosting_enabled": true,
-        "boosting_factor": 1.5
+        "boosting_factor": 1.5,
         "active_learning_tolerance": 1.0,  // Percentage tolerance for similar probabilities. A higher value means more samples are added during adaptive learning.
         "cardinality_threshold_percentile": 95  // Optional, defaults to 95. A lower value means more samples are added during adaptive learning.
     }
