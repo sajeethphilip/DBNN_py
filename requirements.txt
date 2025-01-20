@@ -1,0 +1,39 @@
+# Core dependencies
+torch>=2.0.0  # PyTorch for tensor operations and GPU support
+numpy>=1.24.0  # Numerical computations
+pandas>=2.0.0  # Data manipulation and CSV handling
+scikit-learn>=1.2.0  # Machine learning utilities
+
+# Visualization
+matplotlib>=3.7.0  # Basic plotting
+seaborn>=0.12.0  # Enhanced visualization
+
+# Statistics and data processing
+scipy>=1.10.0  # Scientific computing
+statsmodels>=0.14.0  # Statistical computations
+
+# Progress and interaction
+tqdm>=4.65.0  # Progress bars
+pynput>=1.7.6  # Keyboard monitoring (optional, for interactive training)
+python-xlib>=0.33  # X11 support for Linux (optional)
+
+# File handling and data formats
+requests>=2.31.0  # URL handling and data downloading
+xlrd>=2.0.1  # Excel file support (older .xls)
+openpyxl>=3.1.0  # Excel file support (newer .xlsx)
+
+# Utility
+psutil>=5.9.0  # System and process utilities
+typing-extensions>=4.7.0  # Enhanced type hints
+python-dateutil>=2.8.2  # Date utilities
+
+# Optional but recommended
+numba>=0.57.0  # JIT compilation for performance (optional)
+tensorboard>=2.13.0  # Training visualization (optional)
+plotly>=5.15.0  # Interactive plotting (optional)
+
+# Development and testing
+pytest>=7.4.0  # Testing framework
+black>=23.7.0  # Code formatting
+pylint>=2.17.0  # Code analysis
+mypy>=1.4.0  # Static type checking
