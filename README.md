@@ -21,40 +21,75 @@ Based on "What is there in a training sample?" (2009 World Congress on Nature & 
   - Default: 95 (95th percentile)
   - Example: 75 means selecting samples below the 75th percentile of feature cardinality
 
-### Configuration Options
+### Configuration Options for adaptive_dbnn.conf
 
 ```json
 {
-    "file_path": "dataset.csv",  // Local file or URL
-    "target_column": "target",   // Target variable name
-    "column_names": [...],       // Optional: explicit column names
-    "separator": ",",
-    "has_header": true,
-    "likelihood_config": {
-        "feature_group_size": 2,       // Number of features in each group
-        "max_combinations": 1000,      // Maximum feature combinations
-        "bin_sizes": [64],            // Uniform bins
-        // Or variable bins:
-        // "bin_sizes": [3, 7, 13, 21],
-        "boosting_enabled": true,
-        "boosting_factor": 1.5,
-        "active_learning_tolerance": 3.0,
-        "cardinality_threshold_percentile": 95
-    },
     "training_params": {
-        "trials": 100,                 // Patience for early stopping
-        "cardinality_threshold": 0.9,  // Feature filtering threshold
-        "cardinality_tolerance": 4,    // Decimal precision (-1 for exact)
+        "trials": 100,                                  // Pateince. How many epochs before quitting?
+        "debug_enabled": false,             // Set to true to enable debugging
+        "debug_components": [],    // or "all" or ["data_loading", "training", etc.]
+        "cardinality_threshold": 0.9, // Discards any data that repeats more than this fraction of the data - good to automatically filter out index numbers, etc.
+        "cardinality_tolerance": 4,            // Precision to which data will be truncated after decimal points. -1 means no modification. 2 means round off at two decimal places
         "learning_rate": 0.1,
-        "random_seed": -1,            // -1 for data shuffling
-        "epochs": 1000,
-        "test_fraction": 0.2,
-        "enable_adaptive": true,
-        "compute_device": "auto"       // "cpu", "cuda", or "auto"
+        "random_seed": -1,                      // -1 means random shuffle of data. A positive number means fixed data ordering.
+        "epochs": 100,
+        "test_fraction": 0.2,                       // Traintest fraction
+        "enable_adaptive": true,             // Making it false will allow training to use the entire dataset with train/test fraction split
+        "use_interactive_kbd": false,        // "Enable/disable Keyboard interaction for 'q' and 'Q' keys. Requires graphics environment."
+        "compute_device": "auto",            // "cpu", "cuda", "auto"
+        "modelType":   "Gaussian"           // "Histogram", "Gaussian"
+    },
+    "execution_flags": {
+        "train": true,
+        "train_only": false,
+        "predict": true,
+        "gen_samples": false,
+        "fresh_start": false,                          // true means always start a fresh training
+        "use_previous_model": true      // use the previous model on new data if fresh_start is true else, fresh training on the provided dataset
     }
 }
 ```
+### Configuration Options for sample data (for example, adult.csv from UCI)
+```json
+{
+    "file_path": "adult.csv",  // this could also be a url like  "https://archive.ics.uci.edu/static/public/193/data.csv"
+    "column_names": [
+        "age",
+        "workclass",
+        "fnlwgt",
+        "education",
+        "education-num",
+        "marital-status",
+        "occupation",
+        "relationship",
+        "race",
+        "sex",
+        "capital-gain",
+        "capital-loss",
+        "hours-per-week",
+        "native-country",
+        "income"
+    ],
+    "target_column": "income",
+    "separator": ",",
+    "has_header": true,
+    "likelihood_config": {
+        "feature_group_size": 2,
+        "max_combinations": 1000,
+        "bin_sizes": [
+            21
+        ],
+        "boosting_enabled": true,
+        "boosting_factor": 1.5,
+        "active_learning_tolerance": 1.0,  // Percentage tolerance for similar probabilities
+        "cardinality_threshold_percentile": 95  // Optional, defaults to 95
+        "min_divergence": 0.1  // Minimum required feature divergence between samples
 
+}
+}
+
+```
 ### Feature Selection
 - Add `#` before feature names in the config file to exclude them
 - Automatic filtering of high cardinality features
