@@ -1405,9 +1405,8 @@ class GPUDBNN:
             # Find similar error samples (vectorized)
             max_error = error_margins.max()
             similar_mask = error_margins >= (max_error * (1 - tolerance))
-            similar_indices = torch.nonzero(similar_mask).squeeze()
-
-            if len(similar_indices) == 0:
+            similar_indices = torch.nonzero(similar_mask).flatten()  # Use flatten() instead of squeeze()
+            if similar_indices.numel() == 0:  # Use numel() instead of len()
                 continue
 
             # Get samples that passed error margin check
@@ -1623,6 +1622,8 @@ class GPUDBNN:
             adaptive_patience = 5  # Number of rounds to wait for improvement
             adaptive_patience_counter = 0
             best_overall_accuracy = 0
+            best_train_accuracy = 0
+            best_test_accuracy = 0
 
             # Training loop
             for round_num in range(max_rounds):
@@ -1645,18 +1646,30 @@ class GPUDBNN:
                 train_accuracy = (train_predictions == y_train.cpu()).float().mean()
                 print(f"Training accuracy: {train_accuracy:.4f}")
 
+                # Get test accuracy from results
+                test_accuracy = results['test_accuracy']
+
                 # Check if we're improving overall
-                if train_accuracy > best_overall_accuracy + improvement_threshold:
-                    best_overall_accuracy = train_accuracy
+                improved = False
+                if train_accuracy > best_train_accuracy + improvement_threshold:
+                    best_train_accuracy = train_accuracy
+                    improved = True
+                    print(f"Improved training accuracy to {train_accuracy:.4f}")
+
+                if test_accuracy > best_test_accuracy + improvement_threshold:
+                    best_test_accuracy = test_accuracy
+                    improved = True
+                    print(f"Improved test accuracy to {test_accuracy:.4f}")
+
+                if improved:
                     adaptive_patience_counter = 0
-                    print(f"Improved overall accuracy to {train_accuracy:.4f}")
                 else:
                     adaptive_patience_counter += 1
                     print(f"No significant overall improvement. Adaptive patience: {adaptive_patience_counter}/{adaptive_patience}")
-
                     if adaptive_patience_counter >= adaptive_patience:
-                        print(f"No improvement in training accuracy after {adaptive_patience} rounds of adding samples.")
-                        print(f"Best accuracy achieved: {best_overall_accuracy:.4f}")
+                        print(f"No improvement in accuracy after {adaptive_patience} rounds of adding samples.")
+                        print(f"Best training accuracy achieved: {best_train_accuracy:.4f}")
+                        print(f"Best test accuracy achieved: {best_test_accuracy:.4f}")
                         print("Stopping adaptive training.")
                         break
 
