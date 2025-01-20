@@ -104,11 +104,14 @@ class DatasetConfig:
             "bin_sizes": [20]
         },
         "active_learning": {
-            "tolerance": 1.0,  # Default 1% tolerance for probability matching
-            "cardinality_threshold_percentile": 95 # Default 95th percentile
+            "tolerance": 1.0,
+            "cardinality_threshold_percentile": 95
+        },
+        "training_params": {
+            "Save_training_epochs": False,  # Save the epochs parameter
+            "training_save_path": "training_data"  # Save epochs path parameter
         }
     }
-
 
 
     @staticmethod
@@ -1262,15 +1265,31 @@ class GPUDBNN:
     #------------------------------------------Adaptive Learning--------------------------------------
     def save_epoch_data(self, epoch: int, train_indices: list, test_indices: list):
         """
-        Save training and testing indices for each epoch
+        Save training and testing indices for each epoch if enabled in config
         """
-        epoch_dir = os.path.join(self.base_save_path, f'epoch_{epoch}')
+        # Check if epoch saving is enabled
+        save_epochs = self.config.get('training_params', {}).get('Save_training_epochs', False)
+        if not save_epochs:
+            return
+
+        # Use dataset name as subfolder
+        dataset_folder = os.path.splitext(os.path.basename(self.dataset_name))[0]
+        base_path = self.config.get('training_params', {}).get('training_save_path', 'training_data')
+        save_path = os.path.join(base_path, dataset_folder)
+
+        # Create epoch directory
+        epoch_dir = os.path.join(save_path, f'epoch_{epoch}')
         os.makedirs(epoch_dir, exist_ok=True)
 
-        with open(os.path.join(epoch_dir, f'{modelType}_train_indices.pkl'), 'wb') as f:
-            pickle.dump(train_indices, f)
-        with open(os.path.join(epoch_dir, f'{modelType}_test_indices.pkl'), 'wb') as f:
-            pickle.dump(test_indices, f)
+        # Save indices
+        try:
+            with open(os.path.join(epoch_dir, f'{modelType}_train_indices.pkl'), 'wb') as f:
+                pickle.dump(train_indices, f)
+            with open(os.path.join(epoch_dir, f'{modelType}_test_indices.pkl'), 'wb') as f:
+                pickle.dump(test_indices, f)
+            print(f"Saved epoch {epoch} data to {epoch_dir}")
+        except Exception as e:
+            print(f"Error saving epoch data: {str(e)}")
 
     def load_epoch_data(self, epoch: int):
         """
@@ -1662,6 +1681,9 @@ class GPUDBNN:
                 print(f"\nRound {round_num + 1}/{max_rounds}")
                 print(f"Training set size: {len(train_indices)}")
                 print(f"Test set size: {len(test_indices)}")
+
+                # Save indices for this epoch
+                self.save_epoch_data(round_num, train_indices, test_indices)
 
                 # Create feature tensors for training
                 X_train = self.X_tensor[train_indices]
@@ -2742,6 +2764,10 @@ class GPUDBNN:
         batch_mask = torch.empty(batch_size, dtype=torch.bool, device=self.device)
 
         for epoch in range(self.max_epochs):
+
+            # Save epoch data
+            self.save_epoch_data(epoch, self.train_indices, self.test_indices)
+
             Trstart_time = time.time()
             failed_cases = []
             n_errors = 0
