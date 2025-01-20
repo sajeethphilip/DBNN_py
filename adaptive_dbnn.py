@@ -3222,25 +3222,39 @@ class GPUDBNN:
             # Set a flag to indicate we're printing metrics
             self._last_metrics_printed = True
 
-            # Check if we're in adaptive training
+            # Handle data preparation based on whether we're in adaptive training or final evaluation
             if self.in_adaptive_fit:
                 if not hasattr(self, 'X_tensor') or not hasattr(self, 'y_tensor'):
                     raise ValueError("X_tensor or y_tensor not found. Initialize them in adaptive_fit_predict first.")
 
-                # Use the stored tensors and indices for training
                 if not hasattr(self, 'train_indices') or not hasattr(self, 'test_indices'):
                     raise ValueError("train_indices or test_indices not found")
 
-                # Use stored class attributes
-                X_train = self.X_tensor[self.train_indices]
-                X_test = self.X_tensor[self.test_indices]
-                y_train = self.y_tensor[self.train_indices]
-                y_test = self.y_tensor[self.test_indices]
+                # Use stored tensors and indices, but verify sizes match
+                try:
+                    X_train = self.X_tensor[self.train_indices]
+                    X_test = self.X_tensor[self.test_indices]
+                    y_train = self.y_tensor[self.train_indices]
+                    y_test = self.y_tensor[self.test_indices]
+                except Exception as e:
+                    # If there's any issue with indices, fall back to regular training path
+                    DEBUG.log(f"Error using stored indices: {str(e)}. Falling back to regular training.")
+                    self.in_adaptive_fit = False
+                    # Reset indices and proceed with regular path
+                    self.train_indices = None
+                    self.test_indices = None
+                    return self.fit_predict(batch_size=batch_size, save_path=save_path)
+
             else:
                 # Regular training path
                 X = self.data.drop(columns=[self.target_column])
                 y = self.data[self.target_column]
-                y_encoded = self.label_encoder.fit_transform(y)
+
+                # Check if label encoder is already fitted
+                if not hasattr(self.label_encoder, 'classes_'):
+                    y_encoded = self.label_encoder.fit_transform(y)
+                else:
+                    y_encoded = self.label_encoder.transform(y)
 
                 # Preprocess features including categorical encoding
                 X_processed = self._preprocess_data(X, is_training=True)
@@ -3264,6 +3278,11 @@ class GPUDBNN:
                 y_train = torch.from_numpy(y_train).to(self.device, dtype=torch.long)
                 y_test = torch.from_numpy(y_test).to(self.device, dtype=torch.long)
 
+            # Verify tensor sizes match before training
+            if X_train.size(0) != y_train.size(0) or X_test.size(0) != y_test.size(0):
+                raise ValueError(f"Tensor size mismatch. X_train: {X_train.size(0)}, y_train: {y_train.size(0)}, "
+                               f"X_test: {X_test.size(0)}, y_test: {y_test.size(0)}")
+
             # Train model
             final_W, error_rates = self.train(X_train, y_train, X_test, y_test, batch_size=batch_size)
 
@@ -3272,6 +3291,10 @@ class GPUDBNN:
 
             # Make predictions
             y_pred = self.predict(X_test, batch_size=batch_size)
+
+            # Verify prediction size matches test set
+            if y_pred.size(0) != y_test.size(0):
+                raise ValueError(f"Prediction size mismatch. Predictions: {y_pred.size(0)}, Test set: {y_test.size(0)}")
 
             # Save predictions if path is provided
             if save_path:
@@ -3545,23 +3568,33 @@ class GPUDBNN:
             history = self.adaptive_fit_predict(max_rounds=self.max_epochs, batch_size=batch_size)
             results = self.fit_predict(batch_size=batch_size)
             return results
+#--------------------------------------------------Class Ends ----------------------------------------------------------
 
 def run_gpu_benchmark(dataset_name: str, model=None, batch_size: int = 32):
     """Run benchmark using GPU-optimized implementation"""
     print(f"\nRunning GPU benchmark on {Colors.highlight_dataset(dataset_name)} dataset...")
 
-    history = model.adaptive_fit_predict(max_rounds=model.max_epochs, batch_size=batch_size)
-    results = model.fit_predict(batch_size=batch_size)
+    if Train:
+        # First run adaptive training if enabled
+        if EnableAdaptive:
+            history = model.adaptive_fit_predict(max_rounds=model.max_epochs, batch_size=batch_size)
 
-    plot_training_progress(results['error_rates'], dataset_name)
-    plot_confusion_matrix(
-        results['confusion_matrix'],
-        model.label_encoder.classes_,
-        dataset_name
-    )
+            # Reset train/test indices for final evaluation
+            model.train_indices = None
+            model.test_indices = None
 
-    print(f"\n{Colors.BOLD}Classification Report for {Colors.highlight_dataset(dataset_name)}:{Colors.ENDC}")
-    print(results['classification_report'])
+        # Run final evaluation with standard train/test split
+        results = model.fit_predict(batch_size=batch_size)
+
+        plot_training_progress(results['error_rates'], dataset_name)
+        plot_confusion_matrix(
+            results['confusion_matrix'],
+            model.label_encoder.classes_,
+            dataset_name
+        )
+
+        print(f"\n{Colors.BOLD}Classification Report for {Colors.highlight_dataset(dataset_name)}:{Colors.ENDC}")
+        print(results['classification_report'])
 
     return model, results
 
