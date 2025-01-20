@@ -1461,7 +1461,7 @@ class GPUDBNN:
                     if is_selected:
                         pred_class = pred_classes[similar_indices[low_card_mask]][idx]
                         pred_class_name = self.label_encoder.inverse_transform([pred_class.item()])[0]
-                        print(f"Adding diverse low-cardinality sample from class {true_class_name} "
+                        Debug.log(f"Adding diverse low-cardinality sample from class {true_class_name} "
                               f"(misclassified as {pred_class_name}, "
                               f"error margin: {low_card_margins[idx].item():.3f}, "
                               f"cardinality: {cardinalities[low_card_mask][idx].item()})")
