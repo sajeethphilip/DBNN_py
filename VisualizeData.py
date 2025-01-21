@@ -84,53 +84,200 @@ class EpochVisualizer:
             return None
 
     def _remove_high_cardinality_columns(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Remove high cardinality columns based on threshold from config."""
+        """Optionally remove high cardinality columns based on threshold from config."""
         if not self.global_config:
             return df
 
-        threshold = self.global_config.get('training_params', {}).get('cardinality_threshold', 0.9)
+        # Get threshold from config, but allow it to be disabled
+        threshold = self.global_config.get('training_params', {}).get('cardinality_threshold', None)
+        if threshold is None:  # If no threshold specified, keep all features
+            return df
+
         df_filtered = df.copy()
         columns_to_drop = []
         target_column = self.dataset_config['target_column']
-
-        # Keep track of non-target feature columns
         feature_columns = [col for col in df.columns if col != target_column]
 
+        # Calculate cardinality for all features
+        feature_cardinality = []
         for column in feature_columns:
             unique_count = len(df[column].unique())
             unique_ratio = unique_count / len(df)
+            feature_cardinality.append((column, unique_ratio))
+            print(f"Feature {column} cardinality ratio: {unique_ratio:.3f}")
 
-            if unique_ratio > threshold:
-                columns_to_drop.append(column)
-                print(f"Dropping high cardinality column: {column} (ratio: {unique_ratio:.3f})")
-
-        # Check if we would drop all feature columns
-        remaining_features = [col for col in feature_columns if col not in columns_to_drop]
-
-        if not remaining_features:
-            # Keep the top 3 features with lowest cardinality if we would drop everything
-            feature_cardinality = [(col, len(df[col].unique()) / len(df))
-                                 for col in feature_columns]
-            sorted_features = sorted(feature_cardinality, key=lambda x: x[1])
-            columns_to_keep = [col for col, _ in sorted_features[:3]]
-
-            print("\nWARNING: All features would be dropped due to high cardinality.")
-            print("Keeping top 3 features with lowest cardinality ratios:")
-            for col, ratio in sorted_features[:3]:
-                print(f"- {col} (ratio: {ratio:.3f})")
-
-            columns_to_drop = [col for col in feature_columns if col not in columns_to_keep]
-
-        if columns_to_drop:
-            df_filtered = df_filtered.drop(columns=columns_to_drop)
-
-        # Verify we still have features to work with
+        print("\nKeeping all features regardless of cardinality.")
         remaining_features = [col for col in df_filtered.columns if col != target_column]
-        print(f"\nRemaining features after cardinality filtering: {len(remaining_features)}")
+        print(f"Total features: {len(remaining_features)}")
         print("Features:", remaining_features)
 
         return df_filtered
 
+    def _get_size_mapping(self, data, target_column):
+        """
+        Create a size mapping based on class frequencies.
+        Classes with fewer samples get larger points for visibility.
+        """
+        class_counts = data[target_column].value_counts()
+        max_count = class_counts.max()
+        min_count = class_counts.min()
+
+        # Create inverse size mapping (smaller classes get bigger points)
+        # Using linear scale instead of log to avoid NaN issues
+        size_mapping = {}
+        for class_label, count in class_counts.items():
+            # Linear scaling from 8 to 15
+            if max_count == min_count:
+                size = 10  # If all classes have same count, use middle size
+            else:
+                size = 8 + (7 * (max_count - count) / (max_count - min_count))
+            size_mapping[class_label] = float(size)  # Ensure float type
+
+        # Create array of sizes matching the data
+        sizes = data[target_column].map(size_mapping)
+
+        # Handle any NaN values (shouldn't occur, but just in case)
+        sizes = sizes.fillna(8.0)  # Default to minimum size for any NaN
+
+        print("\nPoint size mapping (class: size):")
+        for class_label, size in size_mapping.items():
+            count = class_counts[class_label]
+            print(f"Class {class_label}: {size:.1f} px ({count} samples)")
+
+        return sizes
+
+    def _create_epoch_visualizations(self, data: pd.DataFrame, set_type: str,
+                                   target_column: str, save_dir: str):
+        """Create all visualizations for one dataset."""
+        # Reset index to ensure alignment
+        data = data.reset_index(drop=True)
+
+        feature_cols = [col for col in data.columns if col != target_column]
+        print(f"\nCreating visualizations using {len(feature_cols)} features")
+
+        # Get size mapping for points based on class frequencies
+        point_sizes = self._get_size_mapping(data, target_column)
+
+        # Scale features
+        scaler = StandardScaler()
+        scaled_features = scaler.fit_transform(data[feature_cols])
+
+        # 1. t-SNE 2D
+        tsne = TSNE(n_components=2, random_state=42, perplexity=min(30, len(data) - 1))
+        tsne_result = tsne.fit_transform(scaled_features)
+
+        tsne_df = pd.DataFrame(tsne_result, columns=['TSNE1', 'TSNE2'])
+        tsne_df[target_column] = data[target_column]
+        tsne_df = tsne_df.reset_index(drop=True)  # Reset index to ensure alignment
+
+        # Instead of using plotly express, use graph objects for more control
+        fig_2d = go.Figure()
+
+        # Add traces for each class separately
+        for class_label in sorted(data[target_column].unique()):
+            mask = tsne_df[target_column] == class_label
+            size_value = float(point_sizes[mask.index[mask]].iloc[0])
+
+            fig_2d.add_trace(go.Scatter(
+                x=tsne_df.loc[mask, 'TSNE1'],
+                y=tsne_df.loc[mask, 'TSNE2'],
+                mode='markers',
+                name=f'Class {class_label}',
+                marker=dict(
+                    size=size_value,
+                    line=dict(width=0.5, color='DarkSlateGrey'),
+                    opacity=0.7
+                )
+            ))
+
+        fig_2d.update_layout(title=f't-SNE 2D Projection - {set_type} set')
+        fig_2d.write_html(os.path.join(save_dir, f'tsne_2d_{set_type}.html'))
+
+        # 2. t-SNE 3D
+        tsne = TSNE(n_components=3, random_state=42, perplexity=min(30, len(data) - 1))
+        tsne_result = tsne.fit_transform(scaled_features)
+
+        tsne_df = pd.DataFrame(tsne_result, columns=['TSNE1', 'TSNE2', 'TSNE3'])
+        tsne_df[target_column] = data[target_column]
+        tsne_df = tsne_df.reset_index(drop=True)  # Reset index to ensure alignment
+
+        fig_3d = go.Figure()
+
+        # Add traces for each class separately
+        for class_label in sorted(data[target_column].unique()):
+            mask = tsne_df[target_column] == class_label
+            size_value = float(point_sizes[mask.index[mask]].iloc[0])
+
+            fig_3d.add_trace(go.Scatter3d(
+                x=tsne_df.loc[mask, 'TSNE1'],
+                y=tsne_df.loc[mask, 'TSNE2'],
+                z=tsne_df.loc[mask, 'TSNE3'],
+                mode='markers',
+                name=f'Class {class_label}',
+                marker=dict(
+                    size=size_value,
+                    line=dict(width=0.5, color='DarkSlateGrey'),
+                    opacity=0.7
+                )
+            ))
+
+        fig_3d.update_layout(title=f't-SNE 3D Projection - {set_type} set')
+        fig_3d.write_html(os.path.join(save_dir, f'tsne_3d_{set_type}.html'))
+
+        # 3. Feature combinations 3D scatter plots
+        if len(feature_cols) >= 3:
+            from itertools import combinations
+            feature_combinations = list(combinations(feature_cols, 3))
+            max_combinations = 10  # Limit number of combinations
+            if len(feature_combinations) > max_combinations:
+                print(f"\nLimiting to {max_combinations} feature combinations for 3D plots")
+                feature_combinations = feature_combinations[:max_combinations]
+
+            for i, (f1, f2, f3) in enumerate(feature_combinations):
+                fig_3d_feat = go.Figure()
+
+                # Add traces for each class separately
+                for class_label in sorted(data[target_column].unique()):
+                    mask = data[target_column] == class_label
+                    size_value = float(point_sizes[mask.index[mask]].iloc[0])
+
+                    fig_3d_feat.add_trace(go.Scatter3d(
+                        x=data.loc[mask, f1],
+                        y=data.loc[mask, f2],
+                        z=data.loc[mask, f3],
+                        mode='markers',
+                        name=f'Class {class_label}',
+                        marker=dict(
+                            size=size_value,
+                            line=dict(width=0.5, color='DarkSlateGrey'),
+                            opacity=0.7
+                        )
+                    ))
+
+                fig_3d_feat.update_layout(
+                    title=f'Features: {f1}, {f2}, {f3} - {set_type} set',
+                    scene=dict(
+                        xaxis_title=f1,
+                        yaxis_title=f2,
+                        zaxis_title=f3
+                    )
+                )
+                fig_3d_feat.write_html(os.path.join(save_dir, f'features_3d_{i+1}_{set_type}.html'))
+
+        # 4. Parallel coordinates (shows all features)
+        print("\nCreating parallel coordinates plot with all features")
+        fig_parallel = px.parallel_coordinates(data, dimensions=feature_cols,
+                                            color=target_column,
+                                            title=f'Parallel Coordinates - {set_type} set')
+        fig_parallel.write_html(os.path.join(save_dir, f'parallel_coords_{set_type}.html'))
+
+        # 5. Correlation Matrix
+        print("Creating correlation matrix visualization")
+        corr_matrix = data[feature_cols + [target_column]].corr()
+        fig_corr = px.imshow(corr_matrix,
+                            title=f'Correlation Matrix - {set_type} set',
+                            aspect='auto')  # Adjust aspect ratio automatically
+        fig_corr.write_html(os.path.join(save_dir, f'correlation_matrix_{set_type}.html'))
     def _load_and_preprocess_data(self) -> pd.DataFrame:
         """Load and preprocess the dataset according to configurations."""
         if not self.dataset_config:
@@ -198,51 +345,6 @@ class EpochVisualizer:
         self._create_epoch_visualizations(test_data, 'test', target_column, epoch_viz_dir)
 
         print(f"Created visualizations for epoch {epoch} in {epoch_viz_dir}")
-
-    def _create_epoch_visualizations(self, data: pd.DataFrame, set_type: str,
-                                   target_column: str, save_dir: str):
-        """Create all visualizations for one dataset."""
-        feature_cols = [col for col in data.columns if col != target_column]
-
-        # Scale features
-        scaler = StandardScaler()
-        scaled_features = scaler.fit_transform(data[feature_cols])
-
-        # 1. t-SNE 2D
-        tsne = TSNE(n_components=2, random_state=42)
-        tsne_result = tsne.fit_transform(scaled_features)
-
-        tsne_df = pd.DataFrame(tsne_result, columns=['TSNE1', 'TSNE2'])
-        tsne_df[target_column] = data[target_column]
-
-        fig_2d = px.scatter(tsne_df, x='TSNE1', y='TSNE2', color=target_column,
-                           title=f't-SNE 2D Projection - {set_type} set')
-        fig_2d.write_html(os.path.join(save_dir, f'tsne_2d_{set_type}.html'))
-
-        # 2. t-SNE 3D
-        tsne = TSNE(n_components=3, random_state=42)
-        tsne_result = tsne.fit_transform(scaled_features)
-
-        tsne_df = pd.DataFrame(tsne_result, columns=['TSNE1', 'TSNE2', 'TSNE3'])
-        tsne_df[target_column] = data[target_column]
-
-        fig_3d = px.scatter_3d(tsne_df, x='TSNE1', y='TSNE2', z='TSNE3',
-                              color=target_column,
-                              title=f't-SNE 3D Projection - {set_type} set')
-        fig_3d.write_html(os.path.join(save_dir, f'tsne_3d_{set_type}.html'))
-
-        # 3. Feature pairs 3D scatter (first 3 features)
-        if len(feature_cols) >= 3:
-            fig_3d_feat = px.scatter_3d(data, x=feature_cols[0], y=feature_cols[1],
-                                      z=feature_cols[2], color=target_column,
-                                      title=f'First 3 Features - {set_type} set')
-            fig_3d_feat.write_html(os.path.join(save_dir, f'features_3d_{set_type}.html'))
-
-        # 4. Parallel coordinates
-        fig_parallel = px.parallel_coordinates(data, dimensions=feature_cols,
-                                            color=target_column,
-                                            title=f'Parallel Coordinates - {set_type} set')
-        fig_parallel.write_html(os.path.join(save_dir, f'parallel_coords_{set_type}.html'))
 
 def main():
     # Get user input
