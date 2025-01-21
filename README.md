@@ -70,7 +70,7 @@ Based on "What is there in a training sample?" (2009 World Congress on Nature & 
         "education-num",
         "marital-status",
         "occupation",
-        "relationship",
+        "relationship",                // Prefix with # to exclude feature
         "race",
         "sex",
         "capital-gain",
@@ -83,14 +83,6 @@ Based on "What is there in a training sample?" (2009 World Congress on Nature & 
     "has_header": true,                    // Whether file has header row
     "target_column": "target",             // Target column name or index
 
-    /* Column configuration */
-    "column_names": [                      // List of column names
-        "feature1",
-        "feature2",
-        "#feature3",                       // Prefix with # to exclude feature
-        "feature4",
-        "target"
-    ],
 
     /* Likelihood computation settings */
     "likelihood_config": {
