@@ -88,7 +88,7 @@ Based on "What is there in a training sample?" (2009 World Congress on Nature & 
     "likelihood_config": {
         "feature_group_size": 2,           // Size of feature groups (usually 2)
         "max_combinations": 1000,          // Maximum feature combinations
-        "bin_sizes": [20]                  // Bin sizes for histogram
+        "bin_sizes": [20]                  // Bin sizes for histogram. This can also be variable sizes  for each feature [20,33,64..]
     },
 
     /* Active learning parameters */
