@@ -1423,36 +1423,79 @@ class GPUDBNN:
 
         return cardinalities
 
+    def _calculate_optimal_batch_size(self, sample_tensor_size):
+        """
+        Calculate optimal batch size based on available GPU memory and sample size.
+
+        Args:
+            sample_tensor_size: Size of one sample tensor in bytes
+
+        Returns:
+            optimal_batch_size: int
+        """
+        if not torch.cuda.is_available():
+            return 128  # Default for CPU
+
+        try:
+            # Get total and reserved GPU memory
+            total_memory = torch.cuda.get_device_properties(0).total_memory
+            reserved_memory = torch.cuda.memory_reserved(0)
+            allocated_memory = torch.cuda.memory_allocated(0)
+
+            # Calculate available memory (leaving 20% as buffer)
+            available_memory = (total_memory - reserved_memory - allocated_memory) * 0.8
+
+            # Calculate memory needed per sample (with buffer for intermediate computations)
+            memory_per_sample = sample_tensor_size * 4  # Factor of 4 for intermediate computations
+
+            # Calculate optimal batch size
+            optimal_batch_size = int(available_memory / memory_per_sample)
+
+            # Enforce minimum and maximum bounds
+            optimal_batch_size = max(32, min(optimal_batch_size, 512))
+
+            DEBUG.log(f" Memory Analysis:")
+            DEBUG.log(f" - Total GPU Memory: {total_memory / 1e9:.2f} GB")
+            DEBUG.log(f" - Reserved Memory: {reserved_memory / 1e9:.2f} GB")
+            DEBUG.log(f" - Allocated Memory: {allocated_memory / 1e9:.2f} GB")
+            DEBUG.log(f" - Available Memory: {available_memory / 1e9:.2f} GB")
+            DEBUG.log(f" - Memory per sample: {memory_per_sample / 1e6:.2f} MB")
+            DEBUG.log(f" - Optimal batch size: {optimal_batch_size}")
+
+            return optimal_batch_size
+
+        except Exception as e:
+            DEBUG.log(f" Error calculating batch size: {str(e)}")
+            return 128  # Default fallback
+
     def _select_samples_from_failed_classes(self, test_predictions, y_test, test_indices):
         """
-        Select both strongly and marginally failing samples for adaptive learning.
-        Uses parallel processing of both cases while maintaining memory efficiency.
+        Memory-efficient implementation of sample selection using batched processing
         """
-        # Get config parameters
+        # Configuration parameters
         active_learning_config = self.config.get('active_learning', {})
         tolerance = active_learning_config.get('tolerance', 1.0) / 100.0
         min_divergence = active_learning_config.get('min_divergence', 0.1)
-
-        # Get margin thresholds from config with defaults
         strong_margin_threshold = active_learning_config.get('strong_margin_threshold', 0.3)
         marginal_margin_threshold = active_learning_config.get('marginal_margin_threshold', 0.1)
-        DEBUG.log(f" Using margin thresholds - Strong: {strong_margin_threshold}, Marginal: {marginal_margin_threshold}")
 
-        # Convert to tensors and move to device
+        # Calculate optimal batch size based on sample size
+        sample_size = self.X_tensor[0].element_size() * self.X_tensor[0].nelement()
+        batch_size = self._calculate_optimal_batch_size(sample_size)
+        DEBUG.log(f"\nUsing dynamic batch size: {batch_size}")
+
         test_predictions = torch.as_tensor(test_predictions, device=self.device)
         y_test = torch.as_tensor(y_test, device=self.device)
         test_indices = torch.as_tensor(test_indices, device=self.device)
 
-        # Find misclassified examples
         misclassified_mask = (test_predictions != y_test)
         misclassified_indices = torch.nonzero(misclassified_mask).squeeze()
 
         if len(misclassified_indices) == 0:
             return []
 
-        # Process each class
-        unique_classes = torch.unique(y_test[misclassified_indices])
         final_selected_indices = []
+        unique_classes = torch.unique(y_test[misclassified_indices])
 
         for class_id in unique_classes:
             class_mask = y_test[misclassified_indices] == class_id
@@ -1461,111 +1504,101 @@ class GPUDBNN:
             if len(class_indices) == 0:
                 continue
 
-            # Get class samples data
-            class_samples_data = self.X_tensor[test_indices[class_indices]]
+            # Process class samples in batches
+            for batch_start in range(0, len(class_indices), batch_size):
+                batch_end = min(batch_start + batch_size, len(class_indices))
+                batch_indices = class_indices[batch_start:batch_end]
 
-            # Compute probabilities
-            if modelType == "Histogram":
-                probs, _ = self._compute_batch_posterior(class_samples_data)
-            else:  # Gaussian
-                probs, _ = self._compute_batch_posterior_std(class_samples_data)
+                # Get batch data
+                batch_samples = self.X_tensor[test_indices[batch_indices]]
 
-            # Compute error margins
-            true_probs = probs[:, class_id]
-            pred_classes = torch.argmax(probs, dim=1)
-            pred_probs = probs[torch.arange(len(pred_classes)), pred_classes]
-            error_margins = pred_probs - true_probs
+                # Compute probabilities for batch
+                if modelType == "Histogram":
+                    probs, _ = self._compute_batch_posterior(batch_samples)
+                else:
+                    probs, _ = self._compute_batch_posterior_std(batch_samples)
 
-            # Split into strong and marginal failures
-            strong_failures = error_margins >= strong_margin_threshold
-            marginal_failures = (error_margins > 0) & (error_margins < marginal_margin_threshold)
+                # Compute error margins for batch
+                true_probs = probs[:, class_id]
+                pred_classes = torch.argmax(probs, dim=1)
+                pred_probs = probs[torch.arange(len(pred_classes)), pred_classes]
+                error_margins = pred_probs - true_probs
 
-            # Process both types of failures
-            for failure_type, failure_mask in [("strong", strong_failures), ("marginal", marginal_failures)]:
-                if not failure_mask.any():
-                    continue
+                # Split into strong and marginal failures
+                strong_failures = error_margins >= strong_margin_threshold
+                marginal_failures = (error_margins > 0) & (error_margins < marginal_margin_threshold)
 
-                # Get samples for this failure type
-                failure_samples_data = class_samples_data[failure_mask]
-                failure_margins = error_margins[failure_mask]
-                failure_orig_indices = test_indices[class_indices[failure_mask]]
+                # Process each failure type
+                for failure_type, failure_mask in [("strong", strong_failures), ("marginal", marginal_failures)]:
+                    if not failure_mask.any():
+                        continue
 
-                # Compute cardinalities for these samples
-                cardinalities = self._compute_feature_cardinalities(failure_samples_data)
-                cardinality_threshold = torch.median(cardinalities)
-                low_card_mask = cardinalities <= cardinality_threshold
+                    # Get failure samples for this batch
+                    failure_samples = batch_samples[failure_mask]
+                    failure_margins = error_margins[failure_mask]
+                    failure_indices = test_indices[batch_indices[failure_mask]]
 
-                # Process samples based on cardinality threshold
-                if low_card_mask.any():
-                    # Get samples meeting cardinality threshold
-                    low_card_data = failure_samples_data[low_card_mask]
+                    # Compute cardinalities for these samples
+                    cardinalities = self._compute_feature_cardinalities(failure_samples)
+
+                    # Use dynamic threshold based on distribution
+                    cardinality_threshold = torch.median(cardinalities)
+                    low_card_mask = cardinalities <= cardinality_threshold
+
+                    if not low_card_mask.any():
+                        continue
+
+                    # Process samples meeting cardinality criteria
+                    low_card_samples = failure_samples[low_card_mask]
                     low_card_margins = failure_margins[low_card_mask]
-                    low_card_orig_indices = failure_orig_indices[low_card_mask]
+                    low_card_indices = failure_indices[low_card_mask]
 
-                    # Add debug information about cardinality distribution
-                    DEBUG.log(f" {failure_type} failures cardinality stats:")
-                    DEBUG.log(f" - Threshold: {cardinality_threshold:.3f}")
-                    DEBUG.log(f" - Number of samples meeting threshold: {low_card_mask.sum().item()}")
-                    DEBUG.log(f" - Cardinality range: {cardinalities[low_card_mask].min().item():.3f} to {cardinalities[low_card_mask].max().item():.3f}")
+                    # Compute divergences only for low cardinality samples
+                    divergences = self._compute_sample_divergence(low_card_samples, self.feature_pairs)
 
-                    # Compute divergences for low cardinality samples
-                    divergences = self._compute_sample_divergence(low_card_data, self.feature_pairs)
+                    # Select diverse samples efficiently
+                    selected_mask = torch.zeros(len(low_card_samples), dtype=torch.bool, device=self.device)
 
-                    # Select diverse samples
-                    selected_mask = torch.zeros(len(low_card_data), dtype=torch.bool, device=self.device)
-
-                    # For strong failures, start with highest margin
-                    # For marginal failures, start with lowest positive margin
+                    # Initialize with best margin sample
                     if failure_type == "strong":
                         best_idx = torch.argmax(low_card_margins)
                     else:
-                        best_idx = torch.argmin(low_card_margins[low_card_margins > 0])
-
+                        best_idx = torch.argmin(low_card_margins)
                     selected_mask[best_idx] = True
 
-                    # Iteratively add diverse samples that meet cardinality criteria
-                    while True:  # Continue until no more suitable candidates found
+                    # Add diverse samples meeting divergence criterion
+                    while True:
+                        # Compute minimum divergence to selected samples
                         min_divs = divergences[:, selected_mask].min(dim=1)[0]
                         candidate_mask = (~selected_mask) & (min_divs >= min_divergence)
 
                         if not candidate_mask.any():
                             break
 
-                        # Select based on margins according to failure type
+                        # Select next sample based on margin type
                         candidate_margins = low_card_margins.clone()
                         candidate_margins[~candidate_mask] = float('inf') if failure_type == "marginal" else float('-inf')
 
-                        if failure_type == "strong":
-                            best_idx = torch.argmax(candidate_margins)
-                        else:
-                            valid_margins = candidate_margins[candidate_margins != float('inf')]
-                            if len(valid_margins) > 0:
-                                best_idx = torch.argmin(candidate_margins)
-                            else:
-                                break
-
+                        best_idx = torch.argmin(candidate_margins) if failure_type == "marginal" else torch.argmax(candidate_margins)
                         selected_mask[best_idx] = True
 
-                    # Add selected samples
-                    selected_indices = low_card_orig_indices[selected_mask]
-                    final_selected_indices.extend(selected_indices.tolist())
+                    # Add selected indices
+                    selected_indices = low_card_indices[selected_mask]
+                    final_selected_indices.extend(selected_indices.cpu().tolist())
 
-                    # Print information about selected samples
+                    # Print selection info
                     true_class_name = self.label_encoder.inverse_transform([class_id.item()])[0]
-                    for idx, is_selected in enumerate(selected_mask):
-                        if is_selected:
-                            pred_class = pred_classes[failure_mask][low_card_mask][idx]
-                            pred_class_name = self.label_encoder.inverse_transform([pred_class.item()])[0]
-                            margin = low_card_margins[idx].item()
-                            card = cardinalities[low_card_mask][idx].item()
+                    n_selected = selected_mask.sum().item()
+                    DEBUG.log(f" Selected {n_selected} {failure_type} failure samples from class {true_class_name}")
+                    DEBUG.log(f" - Cardinality threshold: {cardinality_threshold:.3f}")
+                    DEBUG.log(f" - Average margin: {low_card_margins[selected_mask].mean().item():.3f}")
 
-                            DEBUG.log(f"Adding {failure_type} failure sample from class {true_class_name} "
-                                  f"(misclassified as {pred_class_name}, "
-                                  f"margin: {margin:.3f}, "
-                                  f"cardinality: {card}")
+                # Clear cache after processing each batch
+                torch.cuda.empty_cache()
 
         print(f"\nTotal samples selected: {len(final_selected_indices)}")
         return final_selected_indices
+
     def adaptive_fit_predict(self, max_rounds: int = 10,
                             improvement_threshold: float = 0.001,
                             load_epoch: int = None,
