@@ -26,29 +26,37 @@ Based on "What is there in a training sample?" (2009 World Congress on Nature & 
 ```json
 {
     "training_params": {
-        "trials": 100,                                  // Pateince. How many epochs before quitting?
-        "debug_enabled": false,             // Set to true to enable debugging
-        "debug_components": [],    // or "all" or ["data_loading", "training", etc.]
-        "cardinality_threshold": 0.9, // Discards any data that repeats more than this fraction of the data - good to automatically filter out index numbers, etc.
-        "cardinality_tolerance": 4,            // Precision to which data will be truncated after decimal points. -1 means no modification. 2 means round off at two decimal places
-        "learning_rate": 0.1,
-        "random_seed": -1,                      // -1 means random shuffle of data. A positive number means fixed data ordering.
-        "epochs": 100,
-        "test_fraction": 0.2,                       // Traintest fraction
-        "enable_adaptive": true,             // Making it false will allow training to use the entire dataset with train/test fraction split
-        "use_interactive_kbd": false,        // "Enable/disable Keyboard interaction for 'q' and 'Q' keys. Requires graphics environment."
-        "compute_device": "auto",            // "cpu", "cuda", "auto"
-        "modelType":   "Gaussian"           // "Histogram", "Gaussian"
+        /* Basic training parameters */
+        "trials": 100,                    // Number of epochs to wait for improvement
+        "cardinality_threshold": 0.9,     // Threshold for feature cardinality filtering
+        "cardinality_tolerance": 4,       // Decimal places for feature rounding
+        "learning_rate": 0.1,             // Initial learning rate
+        "random_seed": 42,                // Random seed (-1 for random shuffling)
+        "epochs": 1000,                   // Maximum number of epochs
+        "test_fraction": 0.2,             // Fraction of data to use for testing
+        "enable_adaptive": true,          // Enable adaptive learning
+        
+        /* Model and computation settings */
+        "modelType": "Histogram",         // Model type: "Histogram" or "Gaussian"
+        "compute_device": "auto",         // "auto", "cuda", or "cpu"
+        "use_interactive_kbd": false,     // Enable keyboard interaction
+        "debug_enabled": true,            // Enable detailed debug logging
+        
+        /* Training data management */
+        "Save_training_epochs": true,     // Save data for each epoch
+        "training_save_path": "training_data"  // Path for saving training data
     },
+
     "execution_flags": {
-        "train": true,
-        "train_only": false,
-        "predict": true,
-        "gen_samples": false,
-        "fresh_start": false,                          // true means always start a fresh training
-        "use_previous_model": true      // use the previous model on new data if fresh_start is true else, fresh training on the provided dataset
+        "train": true,                    // Enable training
+        "train_only": false,              // Only perform training
+        "predict": true,                  // Enable prediction
+        "gen_samples": false,             // Generate sample datasets
+        "fresh_start": false,             // Start fresh training
+        "use_previous_model": true        // Use previously trained model if available
     }
 }
+
 ```
 ### Configuration Options for sample data (for example, adult.csv from UCI)
 ```json
@@ -71,26 +79,43 @@ Based on "What is there in a training sample?" (2009 World Congress on Nature & 
         "native-country",
         "income"
     ],
-    "target_column": "income",
-    "separator": ",",
-    "has_header": true,
-    "training_params": {
-        "Save_training_epochs": false,   // Save the data corresponding to each epoch if set to true in the 
-        "training_save_path": "training_data"  //folder specified here.
-    },
-    "likelihood_config": {
-        "feature_group_size": 2,    // specify how many features will be considered together for conditional independence. 
-        "max_combinations": 1000,
-        "bin_sizes": [21],          // Can also specify different bin sizes for each feature  used in the Histogram model.
-        "boosting_enabled": true,    // not currently in use
-        "boosting_factor": 1.5,
-        "active_learning_tolerance": 1.0,  // Percentage tolerance for similar probabilities
-        "cardinality_threshold_percentile": 95  // Optional, defaults to 95
-        "min_divergence": 0.1  // Minimum required feature divergence between samples
-                              //Lower min_divergence (like 0.1) = MORE samples selected (but potentially more redundant)
-                              //Higher min_divergence (like 0.5) = FEWER samples selected (but more distinct from each other)
+    "separator": ",",                      // CSV separator
+    "has_header": true,                    // Whether file has header row
+    "target_column": "target",             // Target column name or index
 
-}
+    /* Column configuration */
+    "column_names": [                      // List of column names
+        "feature1",
+        "feature2",
+        "#feature3",                       // Prefix with # to exclude feature
+        "feature4",
+        "target"
+    ],
+
+    /* Likelihood computation settings */
+    "likelihood_config": {
+        "feature_group_size": 2,           // Size of feature groups (usually 2)
+        "max_combinations": 1000,          // Maximum feature combinations
+        "bin_sizes": [20]                  // Bin sizes for histogram
+    },
+
+    /* Active learning parameters */
+    "active_learning": {
+        "tolerance": 1.0,                  // Learning tolerance
+        "cardinality_threshold_percentile": 95,  // Percentile for cardinality threshold
+        "strong_margin_threshold": 0.3,    // Threshold for strong failures
+        "marginal_margin_threshold": 0.1,  // Threshold for marginal failures
+        "min_divergence": 0.1             // Minimum divergence between samples
+    },
+
+    /* Training parameters specific to this dataset */
+    "training_params": {
+        "Save_training_epochs": true,      // Save epoch-specific data
+        "training_save_path": "training_data/dataset_name"  // Dataset-specific save path
+    },
+
+    /* Model selection */
+    "modelType": "Histogram"               // "Histogram" or "Gaussian"
 }
 
 ```
