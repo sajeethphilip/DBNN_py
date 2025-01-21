@@ -91,11 +91,12 @@ class EpochVisualizer:
         threshold = self.global_config.get('training_params', {}).get('cardinality_threshold', 0.9)
         df_filtered = df.copy()
         columns_to_drop = []
+        target_column = self.dataset_config['target_column']
 
-        for column in df.columns:
-            if column == self.dataset_config['target_column']:
-                continue
+        # Keep track of non-target feature columns
+        feature_columns = [col for col in df.columns if col != target_column]
 
+        for column in feature_columns:
             unique_count = len(df[column].unique())
             unique_ratio = unique_count / len(df)
 
@@ -103,8 +104,30 @@ class EpochVisualizer:
                 columns_to_drop.append(column)
                 print(f"Dropping high cardinality column: {column} (ratio: {unique_ratio:.3f})")
 
+        # Check if we would drop all feature columns
+        remaining_features = [col for col in feature_columns if col not in columns_to_drop]
+
+        if not remaining_features:
+            # Keep the top 3 features with lowest cardinality if we would drop everything
+            feature_cardinality = [(col, len(df[col].unique()) / len(df))
+                                 for col in feature_columns]
+            sorted_features = sorted(feature_cardinality, key=lambda x: x[1])
+            columns_to_keep = [col for col, _ in sorted_features[:3]]
+
+            print("\nWARNING: All features would be dropped due to high cardinality.")
+            print("Keeping top 3 features with lowest cardinality ratios:")
+            for col, ratio in sorted_features[:3]:
+                print(f"- {col} (ratio: {ratio:.3f})")
+
+            columns_to_drop = [col for col in feature_columns if col not in columns_to_keep]
+
         if columns_to_drop:
             df_filtered = df_filtered.drop(columns=columns_to_drop)
+
+        # Verify we still have features to work with
+        remaining_features = [col for col in df_filtered.columns if col != target_column]
+        print(f"\nRemaining features after cardinality filtering: {len(remaining_features)}")
+        print("Features:", remaining_features)
 
         return df_filtered
 
@@ -248,21 +271,26 @@ def main():
     print(f"\nFound {len(epoch_dirs)} epochs of training data")
     epoch_input = input("Enter epoch number (or press Enter for all epochs): ")
 
-    if epoch_input.strip():
-        # Visualize specific epoch
-        try:
+    try:
+        if epoch_input.strip():
+            # Visualize specific epoch
             epoch = int(epoch_input)
-            if f'epoch_{epoch}' not in epoch_dirs:
+            epoch_dir = f'epoch_{epoch}'
+            if epoch_dir not in epoch_dirs:
                 print(f"No data found for epoch {epoch}")
                 return
             visualizer.create_visualizations(epoch)
-        except ValueError:
-            print("Invalid epoch number")
-    else:
-        # Visualize all epochs
-        for epoch_dir in sorted(epoch_dirs, key=lambda x: int(x.split('_')[1])):
-            epoch = int(epoch_dir.split('_')[1])
-            visualizer.create_visualizations(epoch)
+        else:
+            # Visualize all epochs
+            for epoch_dir in sorted(epoch_dirs, key=lambda x: int(x.split('_')[1])):
+                epoch = int(epoch_dir.split('_')[1])
+                print(f"\nProcessing epoch {epoch}...")
+                visualizer.create_visualizations(epoch)
+
+    except ValueError as e:
+        print(f"Error processing epoch: {str(e)}")
+    except Exception as e:
+        print(f"Unexpected error: {str(e)}")
 
 if __name__ == "__main__":
     main()
