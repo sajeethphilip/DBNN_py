@@ -3316,6 +3316,53 @@ class GPUDBNN:
         return categorical_columns
 
 
+
+    def _get_train_test_split(self, X_tensor, y_tensor):
+        """Get or create consistent train-test split"""
+        dataset_folder = os.path.splitext(os.path.basename(self.dataset_name))[0]
+        base_path = self.config.get('training_params', {}).get('training_save_path', 'training_data')
+        split_path = os.path.join(base_path, dataset_folder, 'train_test_split.pkl')
+
+        if os.path.exists(split_path):
+            with open(split_path, 'rb') as f:
+                split_indices = pickle.load(f)
+                train_idx, test_idx = split_indices['train'], split_indices['test']
+                return (X_tensor[train_idx], X_tensor[test_idx],
+                        y_tensor[train_idx], y_tensor[test_idx])
+
+        # Create new split
+        X_train, X_test, y_train, y_test = self._train_test_split_tensor(
+            X_tensor, y_tensor, self.test_size, self.random_state)
+
+        # Save split indices
+        os.makedirs(os.path.dirname(split_path), exist_ok=True)
+        split_indices = {
+            'train': torch.where(X_tensor == X_train.unsqueeze(1))[0],
+            'test': torch.where(X_tensor == X_test.unsqueeze(1))[0]
+        }
+        with open(split_path, 'wb') as f:
+            pickle.dump(split_indices, f)
+
+        return X_train, X_test, y_train, y_test
+
+    def _train_test_split_tensor(self, X, y, test_size, random_state):
+        """Split data consistently using fixed indices"""
+        num_samples = len(X)
+
+        # Generate fixed permutation
+        if random_state == -1:
+            # Use numpy's random permutation directly
+            indices = torch.from_numpy(np.random.permutation(num_samples))
+        else:
+            rng = np.random.RandomState(random_state)
+            indices = torch.from_numpy(rng.permutation(num_samples))
+
+        split = int(num_samples * (1 - test_size))
+        train_idx = indices[:split]
+        test_idx = indices[split:]
+
+        return X[train_idx], X[test_idx], y[train_idx], y[test_idx]
+
     def _multivariate_normal_pdf(self, x, mean, cov):
         """Compute multivariate normal PDF"""
         if x.dim() == 1:
@@ -3757,49 +3804,7 @@ def run_gpu_benchmark(dataset_name: str, model=None, batch_size: int = 32):
 
     return model, results
 
-def _get_train_test_split(self, X_tensor, y_tensor):
-    """Get or create consistent train-test split"""
-    dataset_folder = os.path.splitext(os.path.basename(self.dataset_name))[0]
-    base_path = self.config.get('training_params', {}).get('training_save_path', 'training_data')
-    split_path = os.path.join(base_path, dataset_folder, 'train_test_split.pkl')
 
-    if os.path.exists(split_path):
-        with open(split_path, 'rb') as f:
-            split_indices = pickle.load(f)
-            train_idx, test_idx = split_indices['train'], split_indices['test']
-            return (X_tensor[train_idx], X_tensor[test_idx],
-                    y_tensor[train_idx], y_tensor[test_idx])
-
-    # Create new split
-    X_train, X_test, y_train, y_test = train_test_split_tensor(
-        X_tensor, y_tensor, self.test_size, self.random_state)
-
-    # Save split indices
-    os.makedirs(os.path.dirname(split_path), exist_ok=True)
-    split_indices = {
-        'train': torch.where(X_tensor == X_train.unsqueeze(1))[0],
-        'test': torch.where(X_tensor == X_test.unsqueeze(1))[0]
-    }
-    with open(split_path, 'wb') as f:
-        pickle.dump(split_indices, f)
-
-    return X_train, X_test, y_train, y_test
-
-def train_test_split_tensor(X, y, test_size, random_state):
-    """Split data consistently using fixed indices"""
-    num_samples = len(X)
-
-    # Generate fixed permutation
-    if random_state == -1:
-        random_state = 42
-    rng = np.random.RandomState(random_state)
-    indices = torch.from_numpy(rng.permutation(num_samples))
-
-    split = int(num_samples * (1 - test_size))
-    train_idx = indices[:split]
-    test_idx = indices[split:]
-
-    return X[train_idx], X[test_idx], y[train_idx], y[test_idx]
 
 def plot_training_progress(error_rates: List[float], dataset_name: str):
     """Plot training error rates over epochs"""
