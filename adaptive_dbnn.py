@@ -1491,7 +1491,7 @@ class GPUDBNN:
         misclassified_mask = (test_predictions != y_test)
         misclassified_indices = torch.nonzero(misclassified_mask).squeeze()
 
-        if len(misclassified_indices) == 0:
+        if  misclassified_indices.dim() == 0:
             return []
 
         final_selected_indices = []
@@ -1639,7 +1639,40 @@ class GPUDBNN:
                 self.train_indices = []
             if not hasattr(self, 'test_indices'):
                 self.test_indices = list(range(len(X)))
+            try:
+                # Process initial results
+                results = self.fit_predict(batch_size=batch_size)
 
+                # Calculate accuracy
+                accuracy = 1.0 - results.get('error_rate', 0.0)
+
+                # Handle perfect accuracy
+                if accuracy >= 0.9999:  # Using 0.9999 to account for floating point precision
+                    logger.info("\n" + "="*50)
+                    logger.info("Perfect Accuracy Achieved!")
+                    logger.info("Training Summary:")
+                    logger.info(f"Total Samples: {len(X)}")
+                    logger.info(f"Final Accuracy: {accuracy:.4%}")
+
+                    # Print class distribution
+                    unique_classes = np.unique(y)
+                    logger.info("\nClass Distribution:")
+                    for class_label in unique_classes:
+                        class_count = np.sum(y == class_label)
+                        logger.info(f"Class {class_label}: {class_count} samples")
+
+                    logger.info("\nNo further training needed - model achieved perfect accuracy.")
+                    logger.info("="*50)
+
+                    return {
+                        'train_indices': self.train_indices,
+                        'test_indices': self.test_indices,
+                        'final_accuracy': accuracy,
+                        'error_rate': 0.0,
+                        'status': 'perfect_accuracy'
+                    }
+            except:
+                pass
             unique_classes = np.unique(y_encoded)
 
             # Print class distribution
@@ -1816,7 +1849,8 @@ class GPUDBNN:
 
                     if not new_train_indices:
                         print("Achieved 100% accuracy on all data. Training complete.")
-                        break
+                        self.in_adaptive_fit = False
+                        return {'train_indices': [], 'test_indices': []}
 
                 else:
                     # Training did not achieve 100% accuracy, select new samples
@@ -3829,12 +3863,11 @@ def run_gpu_benchmark(dataset_name: str, model=None, batch_size: int = 32):
         if EnableAdaptive:
             history = model.adaptive_fit_predict(max_rounds=model.max_epochs, batch_size=batch_size)
 
-            # Reset train/test indices for final evaluation
-            model.train_indices = None
-            model.test_indices = None
-
-        # Run final evaluation with standard train/test split
-        results = model.fit_predict(batch_size=batch_size)
+        # Skip fit_predict and just do predictions
+        results = model.predict_and_save(
+            save_path=f"{dataset_name}_predictions.csv",
+            batch_size=batch_size
+        )
 
         plot_training_progress(results['error_rates'], dataset_name)
         plot_confusion_matrix(
