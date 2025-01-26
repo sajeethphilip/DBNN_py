@@ -3692,29 +3692,47 @@ class GPUDBNN:
                 print(f"Warning: Failed to load categorical encoders: {str(e)}")
                 self.categorical_encoders = {}
 
+    def _handle_unmapped_values(self, df_encoded: pd.DataFrame, column: str, unmapped_indices, original_dtype):
+        """Handle unmapped values with proper dtype casting"""
+        if len(unmapped_indices) == 0:
+            return df_encoded
+
+        mapped_values = [v for v in self.categorical_encoders[column].values()
+                        if isinstance(v, (int, float))]
+
+        if mapped_values:
+            mean_value = float(np.mean(mapped_values))
+            if pd.api.types.is_integer_dtype(original_dtype):
+                mean_value = int(round(mean_value))
+
+            # Convert column to float if mean_value is float
+            if isinstance(mean_value, float):
+                df_encoded[column] = df_encoded[column].astype(float)
+
+            df_encoded.loc[unmapped_indices, column] = mean_value
+
+        return df_encoded
+
     def _encode_categorical_features(self, df: pd.DataFrame, is_training: bool = True):
-        """Encode categorical features with proper dtype handling"""
+        """Encode categorical features with dtype handling"""
         DEBUG.log("Starting categorical encoding")
         df_encoded = df.copy()
         categorical_columns = self._detect_categorical_columns(df)
 
         for column in categorical_columns:
-            if is_training:
-                if column not in self.categorical_encoders:
-                    # Create new encoder
-                    unique_values = df[column].fillna('MISSING').unique()
-                    self.categorical_encoders[column] = {
-                        value: idx for idx, value in enumerate(unique_values)
-                    }
+            if is_training and column not in self.categorical_encoders:
+                unique_values = df[column].fillna('MISSING').unique()
+                self.categorical_encoders[column] = {
+                    value: idx for idx, value in enumerate(unique_values)
+                }
 
             if column not in self.categorical_encoders:
                 continue
 
-            # Get original dtype
             original_dtype = df[column].dtype
             mapping = self.categorical_encoders[column]
 
-            # Handle missing values and new categories
+            # Handle missing values and mapping
             df_encoded[column] = df[column].fillna('MISSING').map(
                 lambda x: mapping.get(x, -1)
             )
@@ -3723,26 +3741,12 @@ class GPUDBNN:
             unmapped = df_encoded[df_encoded[column] == -1].index
             if len(unmapped) > 0:
                 DEBUG.log(f"Found {len(unmapped)} unmapped values in column {column}")
+                df_encoded = self._handle_unmapped_values(df_encoded, column, unmapped, original_dtype)
 
-                # Calculate mean value
-                mapped_values = [v for v in mapping.values() if isinstance(v, (int, float))]
-                if mapped_values:
-                    mean_value = float(np.mean(mapped_values))
-
-                    # Convert to proper dtype
-                    if np.issubdtype(original_dtype, np.integer):
-                        mean_value = int(round(mean_value))
-
-                    # Update unmapped values
-                    df_encoded.loc[unmapped, column] = mean_value
-
-        # Verify no categorical columns remain
+        # Convert remaining object columns
         remaining_object_cols = df_encoded.select_dtypes(include=['object']).columns
-        if len(remaining_object_cols) > 0:
-            DEBUG.log(f"Remaining object columns after encoding: {remaining_object_cols}")
-            # Convert any remaining object columns to numeric
-            for col in remaining_object_cols:
-                df_encoded[col] = pd.to_numeric(df_encoded[col], errors='coerce').fillna(0)
+        for col in remaining_object_cols:
+            df_encoded[col] = pd.to_numeric(df_encoded[col], errors='coerce').fillna(0)
 
         DEBUG.log(f"Categorical encoding complete. Shape: {df_encoded.shape}")
         return df_encoded
