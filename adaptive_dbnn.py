@@ -919,6 +919,25 @@ class GPUDBNN:
         self._load_categorical_encoders()
 
 #----------------------
+
+    def setup_dbnn_environment(self):
+        """Setup environment variables for DBNN."""
+        device = self.device.type if isinstance(self.device, torch.device) else self.device
+
+        setattr(self, 'Train_device', device)
+        setattr(self, 'modelType', 'Histogram')
+        setattr(self, 'cardinality_threshold', 0.9)
+        setattr(self, 'cardinality_tolerance', 4)
+        setattr(self, 'nokbd', True)
+        setattr(self, 'EnableAdaptive', True)
+        setattr(self, 'Train', True)
+        setattr(self, 'Predict', True)
+        setattr(self, 'LearningRate', self.learning_rate)
+        setattr(self, 'TestFraction', 0.2)
+
+        os.makedirs('Model', exist_ok=True)
+        os.makedirs('training_data', exist_ok=True)
+
     def _compute_balanced_accuracy(self, y_true, y_pred):
         """Compute class-balanced accuracy"""
         cm = confusion_matrix(y_true, y_pred)
@@ -2072,7 +2091,6 @@ class GPUDBNN:
 
     def _generate_feature_combinations(self, n_features: int, group_size: int, max_combinations: int = None) -> torch.Tensor:
         """Generate and save/load consistent feature combinations"""
-        # Create path for storing feature combinations
         dataset_folder = os.path.splitext(os.path.basename(self.dataset_name))[0]
         base_path = self.config.get('training_params', {}).get('training_save_path', 'training_data')
         combinations_path = os.path.join(base_path, dataset_folder, 'feature_combinations.pkl')
@@ -2083,25 +2101,22 @@ class GPUDBNN:
                 combinations_tensor = pickle.load(f)
                 return combinations_tensor.to(self.device)
 
-        # Generate new combinations if none exist
         if n_features < group_size:
             raise ValueError(f"Number of features ({n_features}) must be >= group size ({group_size})")
 
-        # Generate all possible combinations
-        all_combinations = list(combinations(range(n_features), group_size))
-        if not all_combinations:
-            raise ValueError(f"No valid combinations generated for {n_features} features in groups of {group_size}")
+        # Generate all possible combinations and convert to numpy array
+        all_combinations = np.array(list(combinations(range(n_features), group_size)))
 
         # Sample combinations if max_combinations specified
         if max_combinations and len(all_combinations) > max_combinations:
-            # Use fixed seed for consistent sampling
             rng = np.random.RandomState(42)
-            all_combinations = rng.choice(all_combinations, max_combinations, replace=False)
+            indices = rng.choice(len(all_combinations), max_combinations, replace=False)
+            all_combinations = all_combinations[indices]
 
         # Convert to tensor
         combinations_tensor = torch.tensor(all_combinations, device=self.device)
 
-        # Save combinations for future use
+        # Save combinations
         os.makedirs(os.path.dirname(combinations_path), exist_ok=True)
         with open(combinations_path, 'wb') as f:
             pickle.dump(combinations_tensor.cpu(), f)
@@ -2568,6 +2583,7 @@ class GPUDBNN:
         test_data.to_csv(f'{dataset_name}_Last_testing.csv', index=False)
         print(f"Last testing data is saved to {dataset_name}_Last_testing.csv")
         print(f"Last training data is saved to {dataset_name}_Last_training.csv")
+
     def load_last_known_split(self):
         """Load the last known good training/testing split"""
         dataset_name = self.dataset_name
@@ -2584,16 +2600,21 @@ class GPUDBNN:
             train_indices = []
             test_indices = []
 
+            # Ensure columns are aligned
+            common_cols = list(set(X.columns) & set(train_data.drop(columns=[self.target_column]).columns))
+            X = X[common_cols]
+            train_data_X = train_data.drop(columns=[self.target_column])[common_cols]
+            test_data_X = test_data.drop(columns=[self.target_column])[common_cols]
+
             # Match rows to find indices
             for idx, row in X.iterrows():
-                if any((train_data.drop(columns=[self.target_column]) == row).all(axis=1)):
+                if any((train_data_X == row[common_cols]).all(axis=1)):
                     train_indices.append(idx)
                 else:
                     test_indices.append(idx)
 
             return train_indices, test_indices
         return None, None
-
 #---------------------------------------------------------------------------------------------------------
 
     def predict(self, X: torch.Tensor, batch_size: int = 32):
@@ -2645,7 +2666,7 @@ class GPUDBNN:
                 json.dump(weights_dict, f)
 
     def _load_best_weights(self):
-        """Load the best weights from file if they exist"""
+        """Load the best weights from file"""
         weights_file = self._get_weights_filename()
         if os.path.exists(weights_file):
             with open(weights_file, 'r') as f:
@@ -2653,7 +2674,6 @@ class GPUDBNN:
 
             try:
                 if 'version' in weights_dict and weights_dict['version'] == 2:
-                    # New format (tensor-based)
                     weights_array = np.array(weights_dict['weights'])
                     self.best_W = torch.tensor(
                         weights_array,
@@ -2661,19 +2681,10 @@ class GPUDBNN:
                         device=self.device
                     )
                 else:
-                    # Old format (dictionary-based)
-                    # Convert old format to tensor format
                     class_ids = sorted([int(k) for k in weights_dict.keys()])
-                    max_class_id = max(class_ids)
+                    n_pairs = len(next(iter(weights_dict.values())))
+                    weights_array = np.zeros((max(class_ids) + 1, n_pairs))
 
-                    # Get number of feature pairs from first class
-                    first_class = weights_dict[str(class_ids[0])]
-                    n_pairs = len(first_class)
-
-                    # Initialize tensor
-                    weights_array = np.zeros((max_class_id + 1, n_pairs))
-
-                    # Fill in weights from old format
                     for class_id in class_ids:
                         class_weights = weights_dict[str(class_id)]
                         for pair_idx, (pair, weight) in enumerate(class_weights.items()):
@@ -3777,11 +3788,22 @@ class GPUDBNN:
 
 
     def _load_model_components(self):
-        """Load all model components"""
+        """Load all model components with fallback"""
         components_file = self._get_model_components_filename()
         if os.path.exists(components_file):
-            with open(components_file, 'rb') as f:
-                components = pickle.load(f)
+            try:
+                # First try with weights_only=True
+                components = torch.load(components_file, weights_only=True, map_location=self.device)
+            except Exception as e:
+                print(f"Warning: Safe loading failed ({str(e)}), attempting fallback loading...")
+                try:
+                    # Fallback to regular loading
+                    components = torch.load(components_file, map_location=self.device)
+                except Exception as e:
+                    print(f"Error loading model components: {str(e)}")
+                    return False
+
+            try:
                 self.label_encoder.classes_ = components['target_classes']
                 self.scaler = components['scaler']
                 self.label_encoder = components['label_encoder']
@@ -3790,10 +3812,14 @@ class GPUDBNN:
                 self.feature_columns = components.get('feature_columns')
                 self.categorical_encoders = components['categorical_encoders']
                 self.high_cardinality_columns = components.get('high_cardinality_columns', [])
-                print(f"Loaded model components from {components_file}")
                 self.weight_updater = components.get('weight_updater')
                 self.n_bins_per_dim = components.get('n_bins_per_dim', 20)
+                print(f"Loaded model components from {components_file}")
                 return True
+            except Exception as e:
+                print(f"Error parsing model components: {str(e)}")
+                return False
+
         return False
 
 
