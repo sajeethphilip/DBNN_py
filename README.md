@@ -3,6 +3,35 @@
 The Difference Boosting Neural Network (DBNN), initially published in Intelligent Data Analysis, 4(2000) 463-473, IOS Press, is a simple yet effective Bayesian network that applies imposed conditional independence of joint probability of multiple features for classification. This implementation extends the original work with modern GPU optimization and adaptive learning capabilities.
 
 ## Key Features
+```
+For each adaptive round:
+    # Inner Training Loop
+    While not (converged OR max_epochs reached):
+        - Train only on training data
+        - Update weights based on failed examples in training data:
+            weight_update = learning_rate * (1 - P1/P2)
+            where P1 = posterior prob for true class
+                  P2 = posterior prob for wrongly predicted class
+        - Check convergence criteria:
+            * All training examples correct OR
+            * Training accuracy plateaus for patience iterations OR
+            * Max epochs reached
+```
+    
+    # Testing Phase
+    - Test on all non-training data
+    - For each class in failed test examples:
+        a) Find example with max wrong posterior (P2):
+           if P2 margin > strong_margin_threshold:
+              Add if cardinality low and divergence > min_divergence
+        b) Find example with min wrong posterior:
+           if P2 margin < marginal_margin_threshold:
+              Add if cardinality low and divergence > min_divergence
+    
+    # Save Split if Improved
+    If test_accuracy > best_test_accuracy:
+        - Save current training data (before adding new samples)
+        - Save current test data (before removing new train examples)
 
 ### Model Types
 - **Histogram Model**: Uses non-parametric density estimation with configurable bin sizes
